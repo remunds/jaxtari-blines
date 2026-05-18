@@ -11,6 +11,8 @@ We use the uv package manager. Follow their [installation instructions](https://
 
 Next, install all dependencies by running: `uv sync`.
 
+If you have access tu a GPU, make sure to install the correct JAX version, e.g., `uv add "jax[cuda12]"`.
+
 ## Training 
 To start a training run, simply call `uv run train.py --config configs/<agent_name>`.
 

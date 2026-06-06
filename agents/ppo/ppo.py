@@ -21,7 +21,17 @@ from agents.ppo.ppo_eval import evaluate
 
 from rtpt import RTPT
 
-def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False):
+from reward_machines.games.game_rm import GameRM
+from reward_machines.games.pong_rm import PongRm
+from reward_machines.reward_machine import RewardMachine
+from reward_machines.reward_machine_wrapper import RewardMachineWrapper
+
+
+GAME_RM_REGISTRY = {
+    "pong": PongRm,
+}
+
+def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False, game_rm: GameRM | None=None):
     def thunk():
         # For training (eval=False), avoid applying multiple potentially conflicting
         # mods at once. In that case, fall back to the base environment.
@@ -60,14 +70,18 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
                 clip_reward=True, # only active during training
             )
         else:
-            env = FlattenObservationWrapper(
-                NormalizeObservationWrapper(
-                    ObjectCentricWrapper(
+            env = ObjectCentricWrapper(
                         env,
                         frame_stack_size=4,
                         frame_skip=4,
                         clip_reward=True,
                     )
+            if game_rm is not None:
+                rm = RewardMachine(game_rm)
+                env = RewardMachineWrapper(env, rm)
+            env = FlattenObservationWrapper(
+                NormalizeObservationWrapper(
+                    env
                 )
             )
         env = LogWrapper(env)
@@ -200,8 +214,11 @@ def single_run(config: dict):
     key, network_key, actor_key, critic_key = jax.random.split(key, 4)
     key, obs_sample_key1, obs_sample_key2, obs_sample_key3 = jax.random.split(key, 4)
 
+    # Add Reward Machine
+    rm_name = config.get("GAME_RM", None)
+    game_rm = GAME_RM_REGISTRY[rm_name]() if rm_name is not None else None
     # env setup
-    env = make_env(config["ENV_ID"], list(config["TRAIN_MODS"]), config["PIXEL_BASED"], config["NATIVE_DOWNSCALING"], False)()
+    env = make_env(config["ENV_ID"], list(config["TRAIN_MODS"]), config["PIXEL_BASED"], config["NATIVE_DOWNSCALING"], False, game_rm)()
    
     # vmap and squeeze observations in order to get (B, F, H, W, 1) -> (B, F, H, W),
     # where F is the frame stack which becomes the channel for the convolutions
@@ -428,7 +445,7 @@ def single_run(config: dict):
                     mods=mods_config,
                     pixel_based=config["PIXEL_BASED"],
                     native_downscaling=config["NATIVE_DOWNSCALING"],
-                    eval=True,
+                    eval=True
                 ),
                 config["ENV_ID"],
                 eval_episodes=10,

@@ -1,7 +1,7 @@
 import functools
 import jax
 import jax.numpy as jnp
-from games.game_rm import GameRM
+from reward_machines.games.game_rm import GameRM
 
 
 class PongRm(GameRM):
@@ -43,14 +43,6 @@ class PongRm(GameRM):
         # detect score changes between the two most recent frames
         scored   = obs[-1, SCORE_PLAYER_IDX] > obs[-2, SCORE_PLAYER_IDX]
         conceded = obs[-1, SCORE_ENEMY_IDX]  > obs[-2, SCORE_ENEMY_IDX]
-
-        # DEBUG: remove once verified
-        jax.debug.print(
-            "player {pp}->{pn} | enemy {ep}->{en} || scored={s} conceded={c}",
-            pp=obs[-2, SCORE_PLAYER_IDX], pn=obs[-1, SCORE_PLAYER_IDX],
-            ep=obs[-2, SCORE_ENEMY_IDX],  en=obs[-1, SCORE_ENEMY_IDX],
-            s=scored, c=conceded,
-        )
 
         # boolean proposition vector [scored, conceded] -> bit-encoded by get_prop_index
         return jnp.array([scored, conceded]).astype(jnp.int32)

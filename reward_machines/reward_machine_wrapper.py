@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from flax import struct
 from jaxatari.wrappers import JaxatariWrapper
-from reward_machine import RewardMachine
+from reward_machines.reward_machine import RewardMachine
 
 @struct.dataclass
 class RewardMachineState:

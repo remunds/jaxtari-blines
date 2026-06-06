@@ -15,6 +15,8 @@ UPLOAD_MODEL: False
 
 # default env
 ENV_ID: pong
+# pick reward machine. Must fit to selected env
+GAME_RM: pong
 
 # choose mods to be active during training, default: None
 TRAIN_MODS: []

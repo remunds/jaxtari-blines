@@ -3,9 +3,9 @@ import jax.numpy as jnp
 import jaxatari
 from jaxatari.wrappers import AtariWrapper, ObjectCentricWrapper
 
-from reward_machine import RewardMachine
-from games.pong_rm import PongRm
-from reward_machine_wrapper import RewardMachineWrapper
+from reward_machines.reward_machine import RewardMachine
+from reward_machines.games.pong_rm import PongRm
+from reward_machines.reward_machine_wrapper import RewardMachineWrapper
 
 # Build the chain
 base = jaxatari.make("pong")

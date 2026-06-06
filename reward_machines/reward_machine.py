@@ -2,6 +2,7 @@ import functools
 from flax import struct
 import jax
 import jax.numpy as jnp
+from games.game_rm import GameRM
 
 class RewardMachine:
     # ToDo implement Baseclass GameRM

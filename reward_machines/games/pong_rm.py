@@ -39,10 +39,11 @@ class PongRm(GameRM):
     def get_events(self, obs):
         SCORE_PLAYER_IDX    = 24
         SCORE_ENEMY_IDX     = 25
+        NUM_OBS             = 26
         # obs: frame stack of shape (frame_stack, 26)
         # detect score changes between the two most recent frames
-        scored   = obs[-1, SCORE_PLAYER_IDX] > obs[-2, SCORE_PLAYER_IDX]
-        conceded = obs[-1, SCORE_ENEMY_IDX]  > obs[-2, SCORE_ENEMY_IDX]
+        scored   = obs[-(NUM_OBS - SCORE_PLAYER_IDX)] > obs[-(2 * NUM_OBS - SCORE_PLAYER_IDX)]
+        conceded = obs[-(NUM_OBS - SCORE_ENEMY_IDX)]  > obs[-(2 * NUM_OBS - SCORE_ENEMY_IDX)]
 
         # boolean proposition vector [scored, conceded] -> bit-encoded by get_prop_index
         return jnp.array([scored, conceded]).astype(jnp.int32)

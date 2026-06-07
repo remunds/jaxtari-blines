@@ -76,14 +76,14 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
                         frame_skip=4,
                         clip_reward=True,
                     )
-            if game_rm is not None:
-                rm = RewardMachine(game_rm)
-                env = RewardMachineWrapper(env, rm)
             env = FlattenObservationWrapper(
                 NormalizeObservationWrapper(
                     env
                 )
             )
+            if game_rm is not None:
+                rm = RewardMachine(game_rm)
+                env = RewardMachineWrapper(env, rm)
         env = LogWrapper(env)
         return env
     return thunk
@@ -436,6 +436,10 @@ def single_run(config: dict):
                 eval_configs.append((mods_config, mod_label))
 
         metrics = {}
+
+        rm_name = config.get("GAME_RM", None)
+        game_rm = GAME_RM_REGISTRY[rm_name]() if rm_name is not None else None
+
         for mods_config, mod_label in eval_configs:
             print(f"Evaluating on {mod_label} ...")
             episodic_returns, env_states = evaluate(
@@ -445,7 +449,8 @@ def single_run(config: dict):
                     mods=mods_config,
                     pixel_based=config["PIXEL_BASED"],
                     native_downscaling=config["NATIVE_DOWNSCALING"],
-                    eval=True
+                    eval=True,
+                    game_rm=game_rm
                 ),
                 config["ENV_ID"],
                 eval_episodes=10,

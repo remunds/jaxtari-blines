@@ -72,6 +72,7 @@ def evaluate(
         actions, keys = jax.vmap(get_action_and_value, in_axes=(None, None, 0, 0))(network_params, actor_params, next_obs, keys)
         next_obs, env_state, reward, done, infos = jax.vmap(wrapped_step)(env_state, jnp.array(actions))
         first_states = jax.tree.map(lambda x: x[0], env_state)
+        reward = infos["env_reward"]
         # since the env is eval_env (without reward clipping and episodic life), we can just accumulate the rewards
         return (next_obs, env_state, keys), (first_states, done, reward, actions) 
 
@@ -92,6 +93,6 @@ def evaluate(
 
     # first episode video capture
     # states_until_done = first_obs[:first_done[0] + 1, 0]  # shape: (time_until_done, 1, H, W)
-    env_states_until_done = jax.tree.map(lambda x: x[:first_done[0] + 1], first_states.atari_state.atari_state.env_state)
+    env_states_until_done = jax.tree.map(lambda x: x[:first_done[0] + 1], first_states.atari_state.env_state.atari_state.env_state)
 
     return episodic_returns, env_states_until_done

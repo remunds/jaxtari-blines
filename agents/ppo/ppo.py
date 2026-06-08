@@ -22,14 +22,9 @@ from agents.ppo.ppo_eval import evaluate
 from rtpt import RTPT
 
 from reward_machines.games.game_rm import GameRM
-from reward_machines.games.pong_rm import PongRm
 from reward_machines.reward_machine import RewardMachine
 from reward_machines.reward_machine_wrapper import RewardMachineWrapper
-
-
-GAME_RM_REGISTRY = {
-    "pong": PongRm,
-}
+from reward_machines.rm_registry import GAME_RM_REGISTRY
 
 def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False, game_rm: GameRM | None=None):
     def thunk():

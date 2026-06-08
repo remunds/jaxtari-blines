@@ -15,6 +15,7 @@ def evaluate(
     eval_episodes: int,
     Model: nn.Module,
     seed=1,
+    use_rm=False
 ):
     env: JaxEnvironment | JaxatariWrapper = make_env(env_id)()
     _Network, _Actor, _Critic = Model
@@ -93,6 +94,10 @@ def evaluate(
 
     # first episode video capture
     # states_until_done = first_obs[:first_done[0] + 1, 0]  # shape: (time_until_done, 1, H, W)
-    env_states_until_done = jax.tree.map(lambda x: x[:first_done[0] + 1], first_states.atari_state.env_state.atari_state.env_state)
+    if use_rm:
+        state = first_states.atari_state.env_state.atari_state.env_state
+    else:
+        state = first_states.atari_state.atari_state.env_state
+    env_states_until_done = jax.tree.map(lambda x: x[:first_done[0] + 1], state)
 
     return episodic_returns, env_states_until_done

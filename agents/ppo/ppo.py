@@ -439,6 +439,7 @@ def single_run(config: dict):
 
         rm_name = config.get("GAME_RM", None)
         game_rm = GAME_RM_REGISTRY[rm_name]() if rm_name is not None else None
+        use_rm  = game_rm is not None
 
         for mods_config, mod_label in eval_configs:
             print(f"Evaluating on {mod_label} ...")
@@ -456,6 +457,7 @@ def single_run(config: dict):
                 eval_episodes=10,
                 Model=(Network, Actor, Critic) if config["PIXEL_BASED"] else (MLP_Network, Actor, Critic),
                 seed=config["SEED"],
+                use_rm=use_rm
             )
             # wandb.log({f"eval/episodic_return_{mod_label}": np.mean(jax.device_get(episodic_returns)), "step": iteration})
             metrics[mod_label] = np.mean(jax.device_get(episodic_returns))

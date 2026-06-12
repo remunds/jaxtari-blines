@@ -21,13 +21,28 @@ class GameRM(ABC):
         ...
 
     @abstractmethod
-    def delta_u(self) -> jnp.ndarray:
-        """Transition matrix, shape (num_states, num_prop_combos)."""
+    def from_states(self) -> jnp.ndarray:
+        """Array which saves starting state of Transistion i"""
         ...
 
     @abstractmethod
-    def delta_r(self) -> jnp.ndarray:
-        """Reward matrix, shape (num_states, num_states)."""
+    def to_states(self) -> jnp.ndarray:
+        """Array which saves destination state of Transistion i"""
+        ...
+
+    @abstractmethod
+    def require_false(self) -> jnp.ndarray:
+        """Saves which props need to be false in a Transistion"""
+        ...
+
+    @abstractmethod
+    def require_true(self) -> jnp.ndarray:
+        """Saves which props need to be true in a Transistion"""
+        ...
+
+    @abstractmethod
+    def rewards(self) -> jnp.ndarray:
+        """Saves reward of a Transistion"""
         ...
 
     @abstractmethod

@@ -14,14 +14,14 @@ SAVE_PATH: "./models"
 UPLOAD_MODEL: False
 
 # default env
-ENV_ID: pong
+ENV_ID: pong 
 # pick reward machine. Must fit to selected env
-GAME_RM: pong
+GAME_RM: pong 
 
 # choose mods to be active during training, default: None
 TRAIN_MODS: []
 # choose mods to be evaluated after training
-EVAL_MODS: ["lazy_enemy"]
+EVAL_MODS: []
 
 # eval every N steps during training
 EVAL_DURING_TRAIN: True

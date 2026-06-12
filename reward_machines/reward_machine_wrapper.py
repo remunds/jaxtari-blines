@@ -16,7 +16,6 @@ class RewardMachineState:
 class RewardMachineWrapper(JaxatariWrapper):
     def __init__(self, env, reward_machine: RewardMachine):
         super().__init__(env)
-        # ToDo
         self.rm = reward_machine
         base = self._env.observation_space()
         base_low  = np.broadcast_to(base.low,  base.shape).flatten()

@@ -1,39 +1,34 @@
 import functools
+import numpy as np
 import jax
 import jax.numpy as jnp
 from reward_machines.games.game_rm import GameRM
+from reward_machines.games.utils import build_transitions
 
 
 class PongRm(GameRM):
-    def num_states(self) -> int:
-        return 3
+    PROP_INDEX = {"scored": 0, "conceded": 1}
 
-    def init_state(self) -> int:
-        return 0
+    # transitions: one state (u0), two events. order = priority.
+    TRANSITIONS = [
+        {"from": 0, "true": ["scored"],   "to": 0, "reward":  1.0},
+        {"from": 0, "true": ["conceded"], "to": 0, "reward": -1.0},
+    ]
 
-    def terminal_state(self) -> int:
-        return -99
+    def __init__(self):
+        (self._from, self._rt, self._rf, self._to, self._rew) = build_transitions(
+            len(self.PROP_INDEX), self.PROP_INDEX, self.TRANSITIONS
+        )
 
-    def delta_u(self):
-        # rows = current state (0,1,2)
-        # cols = prop_index: 0=nothing, 1=scored, 2=conceded, 3=both(impossible)
-        # column order MUST match bit-encoding: scored=bit0(+1), conceded=bit1(+2)
-        return jnp.array([
-            # nothing  scored  conceded  both
-            [   0,       1,       2,      0 ],   # from u0
-            [   0,       1,       2,      0 ],   # from u1
-            [   0,       1,       2,      0 ],   # from u2
-        ], dtype=jnp.int32)
+    def num_states(self):     return 1
+    def init_state(self):     return 0
+    def terminal_state(self): return -99
 
-    def delta_r(self):
-        # reward on transition [from_state, to_state]; shape (3,3)
-        # reaching u1 (scored) -> +1, reaching u2 (conceded) -> -1, back to u0 -> 0
-        return jnp.array([
-            # to:  u0     u1     u2
-            [     0.0,   1.0,  -1.0 ],   # from u0
-            [     0.0,   1.0,  -1.0 ],   # from u1
-            [     0.0,   1.0,  -1.0 ],   # from u2
-        ], dtype=jnp.float32)
+    def from_states(self):    return self._from
+    def require_true(self):   return self._rt
+    def require_false(self):  return self._rf
+    def to_states(self):      return self._to
+    def rewards(self):        return self._rew
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def get_events(self, obs):

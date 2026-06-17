@@ -62,5 +62,7 @@ class RewardMachineWrapper(JaxatariWrapper):
         done = jnp.logical_or(terminated, rm_done)
         new_state = RewardMachineState(env_state=env_state, u=next_u)
 
+        total_reward = rm_reward + _env_reward
+
         info["rm_reward"] = rm_reward
-        return aug_obs, new_state, rm_reward, done, truncated, info
+        return aug_obs, new_state, total_reward, done, truncated, info

@@ -1,5 +1,7 @@
 import hydra
 from omegaconf import OmegaConf
+from agents.dqn.dqn import dqn_run
+from agents.ppo.ppo import single_run
 
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
@@ -8,15 +10,17 @@ def main(config):
     print("Config:\n", OmegaConf.to_yaml(OmegaConf.create(config)))
     n_seeds = merged_config.get("NUM_SEEDS", 1)
 
+    if isinstance(merged_config.get("TRAIN_MODS"), list):
+        merged_config["TRAIN_MODS"] = tuple(merged_config["TRAIN_MODS"])
+    if isinstance(merged_config.get("EVAL_MODS"), list):
+        merged_config["EVAL_MODS"] = tuple(merged_config["EVAL_MODS"])
+
     all_metrics = []
     for seed in range(n_seeds):
         if merged_config["ALG"] == "PPO":
-            from agents.ppo.ppo import single_run
             run_fn = single_run
-        elif merged_config["ALG"] == "DQN":  
-            from agents.dqn.dqn import single_run  
-            run_fn = single_run
-        
+        elif merged_config["ALG"] == "DQN":
+            run_fn = dqn_run
         print(f"Running seed {seed} ...")
         merged_config["SEED"] = seed
         metrics = run_fn(merged_config)

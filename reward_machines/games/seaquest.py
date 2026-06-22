@@ -18,12 +18,12 @@ class SeaquestRm(GameRM):
 
     # transitions: one state (u0), two events. order = priority.
     TRANSITIONS = [
-        {"from": 0, "true": ["lost_life"], "to": 0, "reward": -1.0},
-        {"from": 0, "true": ["diver_collected"], "false": ["has_6_divers"], "to": 0, "reward": 1.0},
-        {"from": 0, "true": ["surfaced"], "to": 0, "reward": -0.5},
+        {"from": 0, "true": ["lost_life"], "to": 0, "reward": 0.0},
+        {"from": 0, "true": ["diver_collected"], "false": ["has_6_divers"], "to": 0, "reward": 0.5},
+        {"from": 0, "true": ["surfaced"], "to": 0, "reward": 0.0},
         {"from": 0, "true": ["has_6_divers"], "to": 1, "reward": 1.0},
-        {"from": 0, "true": ["oxygen_low"], "to": 1, "reward": -0.5},
-        {"from": 1, "true": ["lost_life"], "to": 0, "reward": -1.0},
+        {"from": 0, "true": ["oxygen_low"], "to": 1, "reward": 0.0},
+        {"from": 1, "true": ["lost_life"], "to": 0, "reward": 0.0},
         {"from": 1, "true": ["surfaced", "has_6_divers"], "to": 0, "reward": 1.0},
         {"from": 1, "true": ["surfaced"], "false": ["has_6_divers"], "to": 0, "reward": 0.5},
     ]

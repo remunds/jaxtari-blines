@@ -1,6 +1,6 @@
 # experiment params
 NAME_INITIALS: "RE"
-NUM_SEEDS: 4
+NUM_SEEDS: 1
 SEED: 0
 
 # wandb params
@@ -16,7 +16,7 @@ UPLOAD_MODEL: False
 # default env
 ENV_ID: seaquest
 # pick reward machine. Must fit to selected env
-GAME_RM: seaquest
+# GAME_RM: seaquest
 
 # choose mods to be active during training, default: None
 TRAIN_MODS: []

@@ -1,11 +1,3 @@
-# Add this elif block to main.py, after the DQN block:
-#
-#   elif merged_config["ALG"] == "PQN":
-#       from agents.pqn.pqn import single_run
-#       run_fn = single_run
-#
-# Full updated main.py shown below:
-
 import hydra
 from omegaconf import OmegaConf
 

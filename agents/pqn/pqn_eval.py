@@ -1,4 +1,3 @@
-# Adapted from agents/dqn/dqn_eval.py
 from typing import Callable
 
 import flax

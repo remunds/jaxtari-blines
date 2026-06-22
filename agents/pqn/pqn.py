@@ -26,12 +26,12 @@ from agents.pqn.pqn_eval import evaluate
 
 @flax.struct.dataclass
 class Storage:
-    obs:     jnp.array  
-    actions: jnp.array   
-    rewards: jnp.array   
-    dones:   jnp.array   
-    values:  jnp.array   
-    returns: jnp.array   
+    obs:     jnp.array
+    actions: jnp.array
+    rewards: jnp.array
+    dones:   jnp.array
+    values:  jnp.array
+    returns: jnp.array
 
 class QNetworkPixel(nn.Module):
     """CNN Q-network for pixel observations (4×84×84×1 input)."""

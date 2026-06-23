@@ -19,6 +19,7 @@ import flax.linen as nn
 from flax.training.train_state import TrainState
 from agents.dqn.dqn_eval import evaluate_dqn
 import flashbax as fbx
+from agents.dqn.types import TimeStep
 from reward_machines.games.game_rm import GameRM
 from reward_machines.reward_machine import RewardMachine
 from reward_machines.reward_machine_wrapper import RewardMachineWrapper
@@ -95,17 +96,17 @@ class QNetwork(nn.Module):
         x = nn.Dense(self.action_dim)(x)
         return x
 
-class MLP_QNetwork(nn.Module):
-    action_dim: int
-
-    @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(461, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.relu(x)
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.relu(x)
-        x = nn.Dense(self.action_dim, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
-        return x
+# class MLP_QNetwork(nn.Module):
+#     action_dim: int
+#
+#     @nn.compact
+#     def __call__(self, x):
+#         x = nn.Dense(461, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+#         x = nn.relu(x)
+#         x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+#         x = nn.relu(x)
+#         x = nn.Dense(self.action_dim, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+#         return x
 
 
 class DQNTrainState(TrainState):
@@ -193,7 +194,6 @@ class TimeStep:
     reward: chex.Array
     done: chex.Array
 
-
 class CustomTrainState(TrainState):
     target_network_params: flax.core.FrozenDict
     timesteps: int
@@ -222,7 +222,7 @@ def dqn_run(config: dict):
 
     # Add Reward Machine
     rm_name = config.get("GAME_RM", None)
-    game_rm = GAME_RM_REGISTRY[rm_name]() if rm_name is not None else None
+    game_rm: GameRM | None = GAME_RM_REGISTRY[rm_name]() if rm_name is not None else None
     use_rm = game_rm is not None
 
     # env setup
@@ -250,13 +250,24 @@ def dqn_run(config: dict):
 
 
     # INIT BUFFER
+    # if use_rm:
+    #     buffer = fbx.make_flat_buffer(
+    #         max_length=config["BUFFER_SIZE"],
+    #         min_length=config["BUFFER_BATCH_SIZE"],
+    #         sample_batch_size=config["BUFFER_BATCH_SIZE"],
+    #         add_sequences=False,
+    #         add_batch_size=config["NUM_ENVS"]
+    #     )
+    # else: 
     buffer = fbx.make_flat_buffer(
         max_length=config["BUFFER_SIZE"],
         min_length=config["BUFFER_BATCH_SIZE"],
         sample_batch_size=config["BUFFER_BATCH_SIZE"],
         add_sequences=False,
-        add_batch_size=config["NUM_ENVS"],
+        add_batch_size=(config["NUM_ENVS"] * game_rm.num_states())
     )
+
+
     buffer = buffer.replace(
         init=jax.jit(buffer.init),
         add=jax.jit(buffer.add, donate_argnums=0),
@@ -268,7 +279,7 @@ def dqn_run(config: dict):
     _obs, _env_state = env.reset(dummy_rng)
     _obs, _env_state, _reward, _term, _trunc, _info = env.step(_env_state, _action)
     _done = jnp.logical_or(_term, _trunc)
-    _timestep = TimeStep(obs=_obs.squeeze(), action=_action, reward=_reward, done=_done)
+    _timestep = TimeStep(obs=_obs.squeeze(), action=_action, reward=_reward, next_obs=_obs.squeeze(), done=_done)
     buffer_state = buffer.init(_timestep)
 
     # INIT NETWORK AND OPTIMIZER
@@ -337,38 +348,34 @@ def dqn_run(config: dict):
         )  # update timesteps count
 
         # BUFFER UPDATE
-        timestep = TimeStep(obs=last_obs, action=action, reward=reward, done=done)
-        buffer_state = buffer.add(buffer_state, timestep)
+        # timestep = TimeStep(obs=last_obs, action=action, reward=reward, done=done)
+        crm = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:]), info["crm_experiences"])
+        buffer_state = buffer.add(buffer_state, crm) 
+        # buffer_state = buffer.add(buffer_state, info["crm_experiences"])
 
         # NETWORKS UPDATE
         def _learn_phase(train_state, rng):
 
-            learn_batch = buffer.sample(buffer_state, rng).experience
+            learn_batch = buffer.sample(buffer_state, rng).experience.first
 
             # q_next_target = network.apply(
             #     train_state.target_network_params, learn_batch.second.obs
             # )  # (batch_size, num_actions)
             # q_next_target = jnp.max(q_next_target, axis=-1)  # (batch_size,)
-            q_next_online = network.apply(train_state.params, learn_batch.second.obs)
+            q_next_online = network.apply(train_state.params, learn_batch.next_obs)
             next_actions = jnp.argmax(q_next_online, axis=-1)
-            q_next_target = network.apply(train_state.target_network_params, learn_batch.second.obs)
+            q_next_target = network.apply(train_state.target_network_params, learn_batch.next_obs)
             q_next_target = jnp.take_along_axis(q_next_target, next_actions[:, None], axis=-1).squeeze(-1)
 
             target = (
-                learn_batch.first.reward
-                + (1 - learn_batch.first.done) * config["GAMMA"] * q_next_target
+                learn_batch.reward
+                + (1 - learn_batch.done) * config["GAMMA"] * q_next_target
             )
 
             def _loss_fn(params):
-                q_vals = network.apply(
-                    params, learn_batch.first.obs
-                )  # (batch_size, num_actions)
-                chosen_action_qvals = jnp.take_along_axis(
-                    q_vals,
-                    jnp.expand_dims(learn_batch.first.action, axis=-1),
-                    axis=-1,
-                ).squeeze(axis=-1)
-                return jnp.mean((chosen_action_qvals - target) ** 2)
+                q_vals = network.apply(params, learn_batch.obs)
+                chosen = jnp.take_along_axis(q_vals, learn_batch.action[:, None], axis=-1).squeeze(-1)
+                return jnp.mean((chosen - target) ** 2)
 
             loss, grads = jax.value_and_grad(_loss_fn)(train_state.params)
             train_state = train_state.apply_gradients(grads=grads)

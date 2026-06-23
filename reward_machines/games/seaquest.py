@@ -14,18 +14,21 @@ class SeaquestRm(GameRM):
         "diver_collected": 3,
         "has_one_diver": 4,
         "has_6_divers": 5,
+        "scored": 6
     }
 
     # transitions: one state (u0), two events. order = priority.
     TRANSITIONS = [
-        {"from": 0, "true": ["lost_life"], "to": 0, "reward": 0.0},
+        {"from": 0, "true": ["lost_life"], "to": 0, "reward": -1.0},
         {"from": 0, "true": ["diver_collected"], "false": ["has_6_divers"], "to": 0, "reward": 0.5},
-        {"from": 0, "true": ["surfaced"], "to": 0, "reward": 0.0},
+        {"from": 0, "true": ["scored"], "false": ["has_6_divers", "diver_collected"], "to": 0, "reward": 0.1},
+        {"from": 0, "true": ["surfaced"], "to": 0, "reward": -1.0},
         {"from": 0, "true": ["has_6_divers"], "to": 1, "reward": 1.0},
         {"from": 0, "true": ["oxygen_low"], "to": 1, "reward": 0.0},
-        {"from": 1, "true": ["lost_life"], "to": 0, "reward": 0.0},
+        {"from": 1, "true": ["lost_life"], "to": 0, "reward": -1.0},
         {"from": 1, "true": ["surfaced", "has_6_divers"], "to": 0, "reward": 1.0},
         {"from": 1, "true": ["surfaced"], "false": ["has_6_divers"], "to": 0, "reward": 0.5},
+        {"from": 1, "true": ["scored"], "false": ["has_6_divers"], "to": 1, "reward": 0.1},
     ]
 
     def __init__(self):
@@ -64,7 +67,7 @@ class SeaquestRm(GameRM):
         lives_prev      = obs[LIVES  - NUM_FEATURES]
         player_y_prev   = obs[PLAYER_Y - NUM_FEATURES]
 
-        # killed_enemy = score_now > score_prev           # score rose
+        scored = score_now > score_prev           # score rose
         lost_life       = lives_now < lives_prev           # a life was lost
         has_6_divers    = divers_now >= (5.5 / 6.0)         # 6/6 = 1.0; use 5.5 for safety
         oxygen_low      = oxygen_now < (16.0 / 255.0)       # ~16 oxygen units, tune this
@@ -73,11 +76,11 @@ class SeaquestRm(GameRM):
         diver_collected = divers_now > divers_prev 
 
         return jnp.array([
-            # killed_enemy,
             lost_life,
             oxygen_low,
             surfaced,
             diver_collected,
             has_one_diver,
-            has_6_divers
+            has_6_divers,
+            scored
         ]).astype(jnp.int32)

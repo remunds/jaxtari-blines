@@ -16,7 +16,7 @@ UPLOAD_MODEL: False
 # default env
 ENV_ID: seaquest
 # pick reward machine. Must fit to selected env
-# GAME_RM: seaquest
+GAME_RM: seaquest
 
 # choose mods to be active during training, default: None
 TRAIN_MODS: []

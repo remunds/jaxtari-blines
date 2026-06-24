@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/pqn_atari_envpool.py
 import os
 import time
-from collections import deque
+from functools import partial
 
 import flax
 import flax.linen as nn
@@ -34,6 +34,14 @@ class Storage:
     dones:   jnp.array
     values:  jnp.array
     returns: jnp.array
+
+
+@flax.struct.dataclass
+class EpisodeStatistics:
+    episode_returns: jnp.array
+    episode_lengths: jnp.array
+    returned_episode_returns: jnp.array
+    returned_episode_lengths: jnp.array
 
 
 class QNetwork(nn.Module):
@@ -214,6 +222,14 @@ def single_run(config: dict) -> dict:
     if config.get("PIXEL_BASED", True):
         obs_shape = obs_shape[:-1]
 
+    print(f"[PQN] run_name    : {run_name}")
+    print(f"      obs_shape   : {obs_shape}")
+    print(f"      n_actions   : {n_actions}")
+    print(f"      num_envs    : {config.get('NUM_ENVS', 8)}")
+    print(f"      batch_size  : {batch_size}")
+    print(f"      minibatch   : {minibatch_size}")
+    print(f"      iterations  : {num_iterations}")
+
     q_network = QNetwork(n_actions) if config.get("PIXEL_BASED", True) else MLP_QNetwork(n_actions)
 
     total_grad_steps = num_iterations * config.get("UPDATE_EPOCHS", 2) * config.get("NUM_MINIBATCHES", 4)
@@ -236,7 +252,6 @@ def single_run(config: dict) -> dict:
         obs, state = jax.vmap(env.reset)(rng)
         return obs.reshape(rng.shape[0], *obs_shape), state
 
-    @jax.jit
     def vmap_step(state, action):
         next_obs, state, reward, terminated, truncated, info = jax.vmap(env.step)(state, action)
         next_done = jnp.logical_or(terminated, truncated)
@@ -247,12 +262,27 @@ def single_run(config: dict) -> dict:
     next_obs, env_states = vmap_reset(jnp.array(env_keys))
     next_done = jnp.zeros(num_envs, dtype=jnp.float32)
 
+    episode_stats = EpisodeStatistics(
+        episode_returns=jnp.zeros(num_envs, dtype=jnp.float32),
+        episode_lengths=jnp.zeros(num_envs, dtype=jnp.int32),
+        returned_episode_returns=jnp.zeros(num_envs, dtype=jnp.float32),
+        returned_episode_lengths=jnp.zeros(num_envs, dtype=jnp.int32),
+    )
+
+    gamma_val       = config.get("GAMMA", 0.99)
+    qlambda_val     = config.get("Q_LAMBDA", 0.65)
+    num_steps       = config.get("NUM_STEPS", 32)
+    num_minibatches = config.get("NUM_MINIBATCHES", 4)
+    update_epochs   = config.get("UPDATE_EPOCHS", 2)
+    end_e           = config.get("END_E", 0.001)
+    start_e         = config.get("START_E", 1.0)
+
     def step_once(carry, _):
-        q_params, env_states, last_obs, last_done, key, global_step = carry
+        q_params, env_states, last_obs, last_done, key, global_step, ep_stats = carry
 
         epsilon = jnp.maximum(
-            config.get("END_E", 0.001),
-            config.get("START_E", 1.0) + (config.get("END_E", 0.001) - config.get("START_E", 1.0)) * global_step.astype(jnp.float32) / exploration_steps,
+            end_e,
+            start_e + (end_e - start_e) * global_step.astype(jnp.float32) / exploration_steps,
         )
 
         q_vals      = q_network.apply(q_params, last_obs)
@@ -267,24 +297,22 @@ def single_run(config: dict) -> dict:
         next_obs, new_states, rewards, next_done, infos = vmap_step(env_states, actions)
         done = next_done.astype(jnp.float32)
 
+        new_returns = ep_stats.episode_returns + rewards
+        new_lengths = ep_stats.episode_lengths + 1
+        ep_stats = ep_stats.replace(
+            episode_returns=new_returns * (1.0 - done),
+            episode_lengths=new_lengths * (1 - next_done.astype(jnp.int32)),
+            returned_episode_returns=jnp.where(next_done, new_returns, ep_stats.returned_episode_returns),
+            returned_episode_lengths=jnp.where(next_done, new_lengths, ep_stats.returned_episode_lengths),
+        )
+
         storage = Storage(
             obs=last_obs, actions=actions, rewards=rewards,
             dones=last_done, values=max_vals,
             returns=jnp.zeros_like(rewards),
         )
-        new_carry = (q_params, new_states, next_obs, done, key, global_step + num_envs)
-        return new_carry, (storage, infos)
-
-    @jax.jit
-    def rollout(q_params, env_states, last_obs, last_done, key, global_step):
-        init_carry = (q_params, env_states, last_obs, last_done, key, global_step)
-        final_carry, (storage, infos) = jax.lax.scan(
-            step_once, init_carry, None, length=config.get("NUM_STEPS", 32)
-        )
-        return final_carry, storage, infos
-
-    gamma_val   = config.get("GAMMA", 0.99)
-    qlambda_val = config.get("Q_LAMBDA", 0.65)
+        new_carry = (q_params, new_states, next_obs, done, key, global_step + num_envs, ep_stats)
+        return new_carry, storage
 
     def compute_q_lambda_once(carry, inp):
         next_return = carry
@@ -293,7 +321,7 @@ def single_run(config: dict) -> dict:
         return ret, ret
 
     @jax.jit
-    def compute_q_lambda(agent_state: TrainState, next_obs, next_done, storage: Storage):
+    def compute_q_lambda(agent_state, next_obs, next_done, storage):
         next_q   = q_network.apply(agent_state.params, next_obs)
         next_val = jnp.max(next_q, axis=-1)
 
@@ -309,7 +337,7 @@ def single_run(config: dict) -> dict:
         return storage.replace(returns=returns)
 
     @jax.jit
-    def update_pqn(q_state: TrainState, storage: Storage, key):
+    def update_pqn(q_state, storage, key):
         def update_epoch(carry, _):
             q_state, key = carry
             key, subkey = jax.random.split(key)
@@ -319,7 +347,7 @@ def single_run(config: dict) -> dict:
 
             def convert_data(x):
                 x = jax.random.permutation(subkey, x)
-                return jnp.reshape(x, (config.get("NUM_MINIBATCHES", 4), -1) + x.shape[1:])
+                return jnp.reshape(x, (num_minibatches, -1) + x.shape[1:])
 
             flat     = jax.tree_util.tree_map(flatten, storage)
             shuffled = jax.tree_util.tree_map(convert_data, flat)
@@ -338,9 +366,20 @@ def single_run(config: dict) -> dict:
             return (q_state, key), (loss, q_val)
 
         (q_state, key), (loss, q_val) = jax.lax.scan(
-            update_epoch, (q_state, key), (), length=config.get("UPDATE_EPOCHS", 2)
+            update_epoch, (q_state, key), (), length=update_epochs
         )
         return q_state, loss, q_val, key
+
+    @partial(jax.jit, donate_argnums=(0,))
+    def rollout(carry):
+        q_state, env_states, last_obs, last_done, key, global_step, ep_stats = carry
+
+        init_inner = (q_state.params, env_states, last_obs, last_done, key, global_step, ep_stats)
+        final_inner, storage = jax.lax.scan(step_once, init_inner, None, length=num_steps)
+        _, env_states, next_obs, next_done, key, global_step, ep_stats = final_inner
+
+        new_carry = (q_state, env_states, next_obs, next_done, key, global_step, ep_stats)
+        return new_carry, storage
 
     eval_mods_list = list(config.get("EVAL_MODS", [])) or list(config.get("TRAIN_MODS", []))
     eval_configs = [([], "default")]
@@ -416,33 +455,28 @@ def single_run(config: dict) -> dict:
 
         return metrics
 
-    avg_returns = deque(maxlen=20)
     global_step = jnp.int32(0)
-    start_time  = time.time()
+    rollout_carry = (q_state, env_states, next_obs, next_done, key, global_step, episode_stats)
+
+    start_time = time.time()
     total_eval_time = 0.0
 
     for iteration in range(1, num_iterations + 1):
+        iteration_time_start = time.time()
 
-        (_, env_states, next_obs, next_done, key, global_step), storage, infos = rollout(
-            q_state.params, env_states, next_obs, next_done, key, global_step
-        )
-
-        gs = int(global_step)
-        if "returned_episode" in infos:
-            finished = np.array(infos["returned_episode"])
-            ep_rets  = np.array(infos["returned_episode_returns"])
-            for ret in ep_rets[finished]:
-                avg_returns.append(float(ret))
-                wandb.log({
-                    "charts/episodic_return":     float(ret),
-                    "charts/avg_episodic_return": float(np.mean(avg_returns)),
-                }, step=gs)
+        rollout_carry, storage = rollout(rollout_carry)
+        q_state, env_states, next_obs, next_done, key, global_step, episode_stats = rollout_carry
 
         storage = compute_q_lambda(q_state, next_obs, next_done, storage)
 
         update_t0 = time.time()
-        q_state, loss, q_val, key = update_pqn(q_state, storage, key)
+        q_state, losses, q_vals, key = update_pqn(q_state, storage, key)
         update_time = time.time() - update_t0
+
+        rollout_carry = (q_state, env_states, next_obs, next_done, key, global_step, episode_stats)
+
+        iteration_time = time.time() - iteration_time_start
+        gs = int(global_step)
 
         if config.get("EVAL_DURING_TRAIN", True) and (iteration % config.get("EVAL_EVERY", 10) == 0):
             eval_t0 = time.time()
@@ -452,23 +486,26 @@ def single_run(config: dict) -> dict:
         sps        = int(gs / (time.time() - start_time - total_eval_time))
         sps_update = int(batch_size / update_time)
         epsilon    = float(jnp.maximum(
-            config.get("END_E", 0.001),
-            config.get("START_E", 1.0) + (config.get("END_E", 0.001) - config.get("START_E", 1.0)) * gs / exploration_steps
+            end_e,
+            start_e + (end_e - start_e) * gs / exploration_steps
         ))
         wandb.log({
-            "charts/global_step": gs,
-            "charts/epsilon":     epsilon,
-            "charts/SPS":         sps,
-            "charts/SPS_update":  sps_update,
-            "losses/td_loss":     float(loss[-1, -1]),
-            "losses/q_values":    float(q_val[-1, -1]),
+            "charts/avg_episodic_return":  episode_stats.returned_episode_returns.mean().item(),
+            "charts/avg_episodic_length":  episode_stats.returned_episode_lengths.mean().item(),
+            "charts/global_step":          gs,
+            "charts/epsilon":              epsilon,
+            "charts/SPS":                  sps,
+            "charts/SPS_update":           sps_update,
+            "losses/td_loss":              float(losses[-1, -1]),
+            "losses/q_values":             float(q_vals[-1, -1]),
         }, step=gs)
 
         if iteration % max(1, num_iterations // 20) == 0:
             print(f"step: {gs}/{config.get("TOTAL_TIMESTEPS", 10_000_000)} | SPS: {sps} | "
-                  f"avg_return: {np.mean(avg_returns) if avg_returns else 0:.2f}")
+                  f"avg_return: {episode_stats.returned_episode_returns.mean().item():.2f}")
 
     eval_metrics = save_and_eval(config.get("TOTAL_TIMESTEPS", 10_000_000), q_state)
 
     wandb.finish()
+    print("[PQN] Training complete.")
     return eval_metrics

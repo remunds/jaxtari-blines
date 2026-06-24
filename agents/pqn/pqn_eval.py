@@ -25,12 +25,16 @@ def evaluate(
     @jax.jit
     def wrapped_reset(key):
         next_obs, state = env.reset(key)
+        if pixel_based:
+            next_obs = next_obs.squeeze(-1)
         return next_obs[None, ...], state
 
     @jax.jit
     def wrapped_step(state, action):
         next_obs, next_state, reward, terminated, truncated, info = env.step(state, action.squeeze())
         done = jnp.logical_or(terminated, truncated)
+        if pixel_based:
+            next_obs = next_obs.squeeze(-1)
         return next_obs[None, ...], next_state, reward, done, info
 
     key, reset_key, net_key = jax.random.split(key, 3)

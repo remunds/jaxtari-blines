@@ -1,8 +1,14 @@
 ALG: PQN
 EXP_NAME: pqn
+<<<<<<< HEAD
 ENV_ID: pong
 
 PIXEL_BASED: False
+=======
+
+PIXEL_BASED: False
+NATIVE_DOWNSCALING: True
+>>>>>>> origin/pqn_change
 
 TOTAL_TIMESTEPS: 10000000
 NUM_ENVS: 64

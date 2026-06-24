@@ -187,8 +187,6 @@ def single_run(config: dict) -> dict:
     if isinstance(config.get("EVAL_MODS"), list):
         config["EVAL_MODS"] = tuple(config.get("EVAL_MODS", []))
 
-    if config.get("PIXEL_BASED", True) and config.get("NUM_ENVS", 1) > 16:
-        config["NUM_ENVS"] = 8
 
     run_name = f"{config.get("ENV_ID", "pong")}_{config.get("EXP_NAME", "pqn")}_{"oc" if not config.get("PIXEL_BASED", True) else "pixel"}_{config.get("SEED", 0)}"
 

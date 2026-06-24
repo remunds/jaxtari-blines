@@ -19,11 +19,7 @@ def main(config):
         elif merged_config["ALG"] == "PQN":
             from agents.pqn.pqn import single_run
             run_fn = single_run
-<<<<<<< HEAD
 
-=======
-        
->>>>>>> origin/pqn_change
         print(f"Running seed {seed} ...")
         merged_config["SEED"] = seed
         metrics = run_fn(merged_config)

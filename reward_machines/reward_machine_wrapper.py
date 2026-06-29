@@ -56,18 +56,18 @@ class RewardMachineWrapper(JaxatariWrapper):
     
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def _get_crm_experience(self, state, action, prev_obs, obs):
-        next_u, rm_reward, rm_done = self.rm.step(state, obs)
+    def _get_crm_experience(self, state, action, prev_obs, obs, env_done):
+        next_u, rm_reward, _fired_idx, rm_done = self.rm.step(state, obs)
         prev_aug_obs = self._augment_obs(prev_obs, state)
         aug_obs = self._augment_obs(obs, next_u)
-        return TimeStep(obs=prev_aug_obs, action=action, reward=rm_reward, next_obs=aug_obs, done=rm_done)
+        return TimeStep(obs=prev_aug_obs, action=action, reward=rm_reward, next_obs=aug_obs, done=env_done)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def step(self, state, action):
         obs, env_state, _env_reward, terminated, truncated, info = self._env.step(state.env_state, action)
-        next_u, rm_reward, rm_done = self.rm.step(state.u, obs)
-        crm_experiences = jax.vmap(self._get_crm_experience, in_axes=(0, None, None, None))(self.states, action, state.prev_obs, obs)
-
+        done = terminated | truncated
+        next_u, rm_reward, fired_idx, rm_done = self.rm.step(state.u, obs)
+        crm_experiences = jax.vmap(self._get_crm_experience, in_axes=(0, None, None, None, None))(self.states, action, state.prev_obs, obs, done)
 
         episode_over = jnp.logical_or(info["env_done"], truncated)
         next_u = jnp.where(episode_over, self.rm.init_state, next_u)
@@ -81,7 +81,7 @@ class RewardMachineWrapper(JaxatariWrapper):
 
         # Rm should fully decide on the reward
         total_reward = rm_reward
-
+        info["rm_fired_idx"] = fired_idx
         info["rm_reward"] = rm_reward
         info["crm_experiences"] = crm_experiences
         return aug_obs, new_state, total_reward, done, truncated, info

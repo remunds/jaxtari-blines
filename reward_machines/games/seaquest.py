@@ -12,23 +12,59 @@ class SeaquestRm(GameRM):
         "oxygen_low": 1,
         "surfaced": 2,
         "diver_collected": 3,
-        "has_one_diver": 4,
-        "has_6_divers": 5,
-        "scored": 6
+        "scored": 4,
+        "dove" : 5,
+        "at_surface_idle": 6,
     }
 
-    # transitions: one state (u0), two events. order = priority.
     TRANSITIONS = [
-        {"from": 0, "true": ["lost_life"], "to": 0, "reward": -1.0},
-        {"from": 0, "true": ["diver_collected"], "false": ["has_6_divers"], "to": 0, "reward": 0.5},
-        {"from": 0, "true": ["scored"], "false": ["has_6_divers", "diver_collected"], "to": 0, "reward": 0.1},
-        {"from": 0, "true": ["surfaced"], "to": 0, "reward": -1.0},
-        {"from": 0, "true": ["has_6_divers"], "to": 1, "reward": 1.0},
-        {"from": 0, "true": ["oxygen_low"], "to": 1, "reward": 0.0},
-        {"from": 1, "true": ["lost_life"], "to": 0, "reward": -1.0},
-        {"from": 1, "true": ["surfaced", "has_6_divers"], "to": 0, "reward": 1.0},
-        {"from": 1, "true": ["surfaced"], "false": ["has_6_divers"], "to": 0, "reward": 0.5},
-        {"from": 1, "true": ["scored"], "false": ["has_6_divers"], "to": 1, "reward": 0.1},
+        # State 0: 0 divers
+        {"from": 0, "true": ["lost_life"], "to": 0, "reward": -0.5},                                # t0
+        {"from": 0, "true": ["diver_collected"], "to": 1, "reward": 1.0},                           # t1
+        {"from": 0, "true": ["scored"], "false": ["diver_collected", "surfaced"], "to": 0, "reward": 0.5},  # t2
+        {"from": 0, "true": ["surfaced"], "false": ["diver_collected"], "to": 0, "reward": -0.5},   # t3
+        {"from": 0, "true": ["at_surface_idle"], "false": ["lost_life", "diver_collected", "scored", "surfaced"], "to": 0, "reward": -0.02},  # t4
+
+        # State 1: 1 diver
+        {"from": 1, "true": ["lost_life"], "to": 0, "reward": -0.5},                                # t5
+        {"from": 1, "true": ["diver_collected"], "to": 2, "reward": 1.0},                           # t6
+        {"from": 1, "true": ["scored"], "false": ["diver_collected", "surfaced"], "to": 1, "reward": 0.5},  # t7
+        {"from": 1, "true": ["surfaced"], "false": ["diver_collected"], "to": 0, "reward": 0.0},    # t8
+        {"from": 1, "true": ["at_surface_idle"], "false": ["lost_life", "diver_collected", "scored", "surfaced"], "to": 1, "reward": -0.02},  # t9
+
+        # State 2: 2 divers
+        {"from": 2, "true": ["lost_life"], "to": 1, "reward": -0.5},                                # t10
+        {"from": 2, "true": ["diver_collected"], "to": 3, "reward": 1.0},                           # t11
+        {"from": 2, "true": ["scored"], "false": ["diver_collected", "surfaced"], "to": 2, "reward": 0.5},  # t12
+        {"from": 2, "true": ["surfaced"], "false": ["diver_collected"], "to": 1, "reward": 0.0},    # t13
+        {"from": 2, "true": ["at_surface_idle"], "false": ["lost_life", "diver_collected", "scored", "surfaced"], "to": 2, "reward": -0.02},  # t14
+
+        # State 3: 3 divers
+        {"from": 3, "true": ["lost_life"], "to": 2, "reward": -0.5},                                # t15
+        {"from": 3, "true": ["diver_collected"], "to": 4, "reward": 1.0},                           # t16
+        {"from": 3, "true": ["scored"], "false": ["diver_collected", "surfaced"], "to": 3, "reward": 0.5},  # t17
+        {"from": 3, "true": ["surfaced"], "false": ["diver_collected"], "to": 2, "reward": 0.0},    # t18
+        {"from": 3, "true": ["at_surface_idle"], "false": ["lost_life", "diver_collected", "scored", "surfaced"], "to": 3, "reward": -0.02},  # t19
+
+        # State 4: 4 divers
+        {"from": 4, "true": ["lost_life"], "to": 3, "reward": -0.5},                                # t20
+        {"from": 4, "true": ["diver_collected"], "to": 5, "reward": 1.0},                           # t21
+        {"from": 4, "true": ["scored"], "false": ["diver_collected", "surfaced"], "to": 4, "reward": 0.5},  # t22
+        {"from": 4, "true": ["surfaced"], "false": ["diver_collected"], "to": 3, "reward": 0.0},    # t23
+        {"from": 4, "true": ["at_surface_idle"], "false": ["lost_life", "diver_collected", "scored", "surfaced"], "to": 4, "reward": -0.02},  # t24
+
+        # State 5: 5 divers
+        {"from": 5, "true": ["lost_life"], "to": 4, "reward": -0.5},                                # t25
+        {"from": 5, "true": ["diver_collected"], "to": 6, "reward": 1.0},                           # t26
+        {"from": 5, "true": ["scored"], "false": ["diver_collected", "surfaced"], "to": 5, "reward": 0.5},  # t27
+        {"from": 5, "true": ["surfaced"], "false": ["diver_collected"], "to": 4, "reward": 0.0},    # t28
+        {"from": 5, "true": ["at_surface_idle"], "false": ["lost_life", "diver_collected", "scored", "surfaced"], "to": 5, "reward": -0.02},  # t29
+
+        # State 6: 6 divers — goal.
+        {"from": 6, "true": ["lost_life"], "to": 5, "reward": -0.5},                                # t30
+        {"from": 6, "true": ["scored"], "false": ["surfaced"], "to": 6, "reward": 0.5},             # t31
+        {"from": 6, "true": ["surfaced"], "to": 0, "reward": 10.0},                                 # t32
+        {"from": 6, "true": ["at_surface_idle"], "false": ["lost_life", "scored", "surfaced"], "to": 6, "reward": -0.02},  # t33
     ]
 
     def __init__(self):
@@ -36,7 +72,7 @@ class SeaquestRm(GameRM):
             len(self.PROP_INDEX), self.PROP_INDEX, self.TRANSITIONS
         )
 
-    def num_states(self):     return 2
+    def num_states(self):     return 7
     def init_state(self):     return 0
     def terminal_state(self): return -99
 
@@ -69,18 +105,19 @@ class SeaquestRm(GameRM):
 
         scored = score_now > score_prev           # score rose
         lost_life       = lives_now < lives_prev           # a life was lost
-        has_6_divers    = divers_now >= (5.5 / 6.0)         # 6/6 = 1.0; use 5.5 for safety
-        oxygen_low      = oxygen_now < (16.0 / 255.0)       # ~16 oxygen units, tune this
-        surfaced        = (player_y_now <= (46.5 / 210.0)) & (player_y_prev > player_y_now)    # player_y == 46 → at surface
-        has_one_diver   = (divers_now > (0.5 / 6.0)) & (divers_now < (1.5 / 6.0))
-        diver_collected = divers_now > divers_prev 
+        oxygen_low      = oxygen_now < (12.0 / 255.0)       # ~16 oxygen units, tune this
+        oxygen_full     = oxygen_now > (63.0 / 255.0)       # ~16 oxygen units, tune this
+        surfaced        = (player_y_now < (46.5 / 210.0)) & (player_y_prev > player_y_now)    # player_y == 46 → at surface
+        dove            = (player_y_prev <= (52 / 210.0)) & (player_y_prev < player_y_now) & oxygen_full
+        diver_collected = divers_now > divers_prev
+        at_surface_idle = (player_y_now <= (46.5 / 210.0)) & oxygen_full & ~surfaced
 
         return jnp.array([
             lost_life,
             oxygen_low,
             surfaced,
             diver_collected,
-            has_one_diver,
-            has_6_divers,
-            scored
+            scored,
+            dove,
+            at_surface_idle,
         ]).astype(jnp.int32)

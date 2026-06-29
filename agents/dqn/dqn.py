@@ -62,7 +62,7 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
                 frame_stack_size=4,
                 frame_skip=4,
                 max_pooling=True,
-                clip_reward=True, # only active during training
+                clip_reward=False, # only active during training
             )
         else:
             env = ObjectCentricWrapper(
@@ -73,7 +73,8 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
                     )
             env = FlattenObservationWrapper(
                 NormalizeObservationWrapper(
-                    env
+                    env,
+                    dtype=jnp.float32,
                 )
             )
             if game_rm is not None:
@@ -293,7 +294,7 @@ def dqn_run(config: dict):
         return config["LR"] * frac
 
     lr = linear_schedule if config.get("LR_LINEAR_DECAY", False) else config["LR"]
-    tx = optax.adam(learning_rate=lr)
+    tx = optax.chain(optax.clip_by_global_norm(10.0), optax.adam(learning_rate=lr))
 
     train_state = CustomTrainState.create(
         apply_fn=network.apply,
@@ -383,13 +384,14 @@ def dqn_run(config: dict):
             return train_state, loss
 
         rng, _rng = jax.random.split(rng)
+        env_iters = train_state.timesteps // config["NUM_ENVS"]
         is_learn_time = (
             (buffer.can_sample(buffer_state))
             & (  # enough experience in buffer
                 train_state.timesteps > config["LEARNING_STARTS"]
             )
             & (  # pure exploration phase ended
-                train_state.timesteps % config["TRAINING_INTERVAL"] == 0
+                env_iters % config["TRAINING_INTERVAL"] == 0
             )  # training interval
         )
         train_state, loss = jax.lax.cond(
@@ -402,7 +404,7 @@ def dqn_run(config: dict):
 
         # update target network
         train_state = jax.lax.cond(
-            train_state.timesteps % config["TARGET_UPDATE_INTERVAL"] == 0,
+            env_iters % config["TARGET_UPDATE_INTERVAL"] == 0,
             lambda train_state: train_state.replace(
                 target_network_params=optax.incremental_update(
                     train_state.params,
@@ -413,12 +415,16 @@ def dqn_run(config: dict):
             lambda train_state: train_state,
             operand=train_state,
         )
-
+        fired = info["rm_fired_idx"]
+        hist = jnp.sum(jax.nn.one_hot(fired, num_transitions), axis=0)
         metrics = {
             "timesteps": train_state.timesteps,
             "updates": train_state.n_updates,
             "loss": loss.mean(),
             "returns": info["returned_episode_returns"].mean(),
+            "env_reward": info["env_reward"].mean(),
+            "rm_reward": info["rm_reward"].mean(),
+            "fired_hist": hist
         }
 
         runner_state = (train_state, buffer_state, env_state, obs, rng)
@@ -462,6 +468,7 @@ def dqn_run(config: dict):
     # --- CHUNKED TRAINING LOOP (replaces the single big scan) ---
     updates_per_eval = config["EVAL_EVERY"]
     num_chunks = config["NUM_UPDATES"] // updates_per_eval
+    num_transitions = len(game_rm.TRANSITIONS)
 
     @jax.jit
     def train_chunk(runner_state):
@@ -477,19 +484,22 @@ def dqn_run(config: dict):
         train_state = runner_state[0]
         global_step = int(train_state.timesteps)
 
+        for idx in range(num_transitions):
+            wandb.log({f"transitions/t{idx}": float(chunk_metrics["fired_hist"][..., idx].sum())}, step=global_step)
         wandb.log({
+            "charts/rm_reward_per_step": float(chunk_metrics["rm_reward"].mean()),
             "charts/avg_episodic_return": float(chunk_metrics["returns"].mean()),
             "losses/td_loss": float(chunk_metrics["loss"].mean()),
             "charts/global_step": global_step,
             "charts/SPS": int(global_step / (time.time() - start_time)),
             "charts/time": time.time() - start_time,
-        }, step=chunk)
+        }, step=global_step)
 
         if config["EVAL_DURING_TRAIN"]:
-            eval_metrics = save_and_eval(train_state.params, chunk)
+            eval_metrics = save_and_eval(train_state.params, global_step)
 
     print(f"Total train time: {(time.time() - start_time)/60:.2f} minutes.")
-    eval_metrics = save_and_eval(train_state.params, num_chunks + 1)
+    eval_metrics = save_and_eval(train_state.params, train_state.timesteps)
     wandb.finish()
 
     return eval_metrics

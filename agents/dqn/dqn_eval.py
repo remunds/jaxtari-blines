@@ -35,15 +35,15 @@ def evaluate_dqn(
 
     @jax.jit
     def get_action(params, obs):
-        q_vals = network.apply(params, obs)     # (1, num_actions)
-        return jnp.argmax(q_vals, axis=-1)       # greedy: no epsilon, no sampling
+        q_vals = network.apply(params, obs)
+        return jnp.argmax(q_vals, axis=-1)
 
     def step_fn(carry, _):
         next_obs, env_state = carry
         actions = jax.vmap(get_action, in_axes=(None, 0))(network_params, next_obs)
         next_obs, env_state, reward, done, infos = jax.vmap(wrapped_step)(env_state, jnp.array(actions))
         first_states = jax.tree.map(lambda x: x[0], env_state)
-        reward = infos["env_reward"]             # honest game score, same metric as PPO
+        reward = infos["env_reward"]
         return (next_obs, env_state), (first_states, done, reward, actions)
 
     reset_keys = jax.random.split(key, eval_episodes)

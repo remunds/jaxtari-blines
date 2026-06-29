@@ -36,8 +36,9 @@ class RewardMachine:
 
         any_valid = jnp.any(valid)
         first_idx = jnp.argmax(valid)
+        fired_idx = jnp.where(any_valid, first_idx, -1)
 
         next_state = jnp.where(any_valid, self.to_states[first_idx], current_state)
         rew        = jnp.where(any_valid, self.rewards[first_idx], 0.0)
         done       = (next_state == self.terminal_state)
-        return next_state, rew, done
+        return next_state, rew, fired_idx, done

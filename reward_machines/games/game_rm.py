@@ -5,6 +5,9 @@ import jax
 import jax.numpy as jnp
 
 class GameRM(ABC):
+
+    TRANSITIONS = []
+
     @abstractmethod
     def num_states(self) -> int:
         """Number of RM states (including the terminal state)."""

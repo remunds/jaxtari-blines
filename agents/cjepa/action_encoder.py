@@ -20,8 +20,8 @@ class ActionEncoder(nn.Module):
     """
 
     num_actions: int
-    emb_dim: int = 16
-    hidden_dim: int = 64
+    emb_dim: int = 128
+    hidden_dim: int = 256
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:

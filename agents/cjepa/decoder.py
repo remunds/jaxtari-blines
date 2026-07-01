@@ -19,9 +19,9 @@ class SlotDecoder(nn.Module):
     Applied via vmap over the slot dimension.
     """
 
-    slot_dim: int = 64
+    slot_dim: int = 128
     obj_attr_dim: int = 8
-    hidden_dim: int = 128
+    hidden_dim: int = 256
 
     @nn.compact
     def __call__(self, slots: jnp.ndarray) -> jnp.ndarray:

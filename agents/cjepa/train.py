@@ -135,10 +135,10 @@ def single_run(config: dict):
           f"num_actions={num_actions}, obs_dim={obs_dim}")
 
     # Hyperparameters
-    slot_dim = config.get("SLOT_DIM", 64)
+    slot_dim = config.get("SLOT_DIM", 128)
     history_frames = config.get("HISTORY_FRAMES", 3)
     pred_frames = config.get("PRED_FRAMES", 1)
-    num_masked_slots = config.get("NUM_MASKED_SLOTS", 1)
+    max_masked_slots = config.get("MAX_MASKED_SLOTS", 2)
     action_emb_dim = config.get("ACTION_EMB_DIM", 16)
     transformer_depth = config.get("TRANSFORMER_DEPTH", 6)
     transformer_heads = config.get("TRANSFORMER_HEADS", 8)
@@ -147,7 +147,7 @@ def single_run(config: dict):
     dropout = config.get("TRANSFORMER_DROPOUT", 0.1)
 
     batch_size = config.get("BATCH_SIZE", 64)
-    learning_rate = config.get("LEARNING_RATE", 1e-4)
+    learning_rate = config.get("LEARNING_RATE", 5e-4)
     max_grad_norm = config.get("MAX_GRAD_NORM", 1.0)
     num_train_steps = int(config.get("NUM_TRAIN_STEPS", 50000))
     eval_every = config.get("EVAL_EVERY", 500)
@@ -171,7 +171,7 @@ def single_run(config: dict):
         slot_dim=slot_dim,
         history_frames=history_frames,
         pred_frames=pred_frames,
-        num_masked_slots=num_masked_slots,
+        max_masked_slots=max_masked_slots,
         action_emb_dim=action_emb_dim,
         transformer_depth=transformer_depth,
         transformer_heads=transformer_heads,
@@ -277,24 +277,32 @@ def single_run(config: dict):
             if step % 10 == 0 or step == 1:
                 wandb.log({
                     "train/loss": loss,
+                    "train/loss_future": float(step_info.get("loss_future", 0)),
+                    "train/loss_masked_history": float(step_info.get("loss_masked_history", 0)),
                     "train/predicted_norm": float(step_info.get("predicted_norm", 0)),
                     "train/target_norm": float(step_info.get("target_norm", 0)),
                     "train/step_time": step_time,
                     "train/step": step,
                 }, step=step)
 
+                # Log per-masked-slot MSE
                 for key in infos:
                     if key.startswith("slot_"):
                         wandb.log({f"train/{key}": float(step_info[key])}, step=step)
+                # Log which actual slot index was masked (scalar survives scan)
+                if 'masked_slot_0_idx' in step_info:
+                    wandb.log({"train/masked_actual_slot": float(step_info['masked_slot_0_idx'])}, step=step)
 
             # Print progress every 100 steps
             if step % 100 == 0 or step == 1:
-                masked_str = ", ".join(
-                    [f"slot_{i}_mse={step_info.get(f'slot_{i}_mse', 0):.4f}"
-                     for i in range(min(num_masked_slots, 3))]
-                )
-                print(f"  Step {step}/{num_train_steps} | loss={loss:.4f} | "
-                      f"{masked_str} | {step_time*1000:.1f}ms/step")
+                actual_slot = int(step_info.get('masked_slot_0_idx', -1))
+                mse_val = step_info.get('slot_0_mse', 0)
+                fut = step_info.get('loss_future', 0)
+                hist = step_info.get('loss_masked_history', 0)
+                print(f"  Step {step}/{num_train_steps} | loss={loss:.4f} "
+                      f"(future={fut:.4f}, hist_masked={hist:.4f}) | "
+                      f"masked slot {actual_slot} mse={mse_val:.4f} | "
+                      f"{step_time*1000:.1f}ms/step")
 
             # Evaluation
             if step % eval_every == 0:

@@ -404,7 +404,7 @@ def main():
 
     model = CJEPA(
         num_slots=num_slots, obj_attr_dim=obj_attr_dim, num_actions=num_actions,
-        slot_dim=64, history_frames=3, pred_frames=1, num_masked_slots=1,
+        slot_dim=128, history_frames=3, pred_frames=1, max_masked_slots=1,
         action_emb_dim=16, transformer_depth=6, transformer_heads=8,
         transformer_dim_head=64, transformer_mlp_dim=2048, dropout=0.1,
     )

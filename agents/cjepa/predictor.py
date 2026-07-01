@@ -23,12 +23,18 @@ class MaskedSlotPredictor(nn.Module):
     Architecture:
         mask_token + time_pos_embed + anchor_query → NonCausalTransformer → to_out
 
+    During training, a random number k in [0, max_masked_slots] of object slots
+    are masked at each step. Masked slots get query tokens (no real data) for
+    all timesteps except t=0 (identity anchor). The loss is computed only on
+    the k active masked slots.
+
     Args:
         num_slots: Total number of slots per frame.
         slot_dim: Dimension of each slot.
         history_frames: Number of input (history) frames.
         pred_frames: Number of future frames to predict.
-        num_masked_slots: Number of object slots to mask during training.
+        max_masked_slots: Max number of object slots to mask during training
+                          (actual number is randomly chosen in [0, max]).
         depth: Transformer depth.
         num_heads: Number of attention heads.
         dim_head: Dimension per head.
@@ -36,12 +42,12 @@ class MaskedSlotPredictor(nn.Module):
         dropout: Dropout rate.
     """
     num_slots: int
-    slot_dim: int = 64
+    slot_dim: int = 128
     history_frames: int = 3
     pred_frames: int = 1
-    num_masked_slots: int = 1
+    max_masked_slots: int = 2
     depth: int = 6
-    num_heads: int = 8
+    num_heads: int = 16
     dim_head: int = 64
     mlp_dim: int = 2048
     dropout: float = 0.1
@@ -91,33 +97,58 @@ class MaskedSlotPredictor(nn.Module):
     def get_mask_indices(
         self,
         rng: jax.Array,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Select N slots to mask.
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Select 0..max_masked_slots slots to mask.
+
+        Always returns max_masked_slots indices (static shape for JIT), but
+        only the first k are "active" — the rest are padded and ignored.
 
         Returns:
             is_slot_masked: boolean [num_slots] — True means masked (target).
-            masked_indices: int [num_masked_slots] — indices of masked slots.
+            masked_indices: int [max_masked_slots] — indices of candidate slots.
+            active_mask: boolean [max_masked_slots] — True for actually-masked slots.
         """
-        if self.num_masked_slots <= 0:
-            masked_indices = jnp.array([], dtype=jnp.int32)
-            is_slot_masked = jnp.zeros(self.num_slots, dtype=jnp.bool_)
-            return is_slot_masked, masked_indices
+        max_k = self.max_masked_slots
+        num_slots = self.num_slots
 
-        # Randomly select N distinct slots to mask
-        # Using permutation + first N (handles case when num_masked_slots > num_slots)
-        perm = jax.random.permutation(rng, self.num_slots)
-        masked_indices = perm[:self.num_masked_slots]
+        if max_k <= 0:
+            masked_indices = jnp.zeros(max_k, dtype=jnp.int32)
+            is_slot_masked = jnp.zeros(num_slots, dtype=jnp.bool_)
+            active_mask = jnp.zeros(max_k, dtype=jnp.bool_)
+            return is_slot_masked, masked_indices, active_mask
 
-        is_slot_masked = jnp.zeros(self.num_slots, dtype=jnp.bool_)
-        is_slot_masked = is_slot_masked.at[masked_indices].set(True)
-        return is_slot_masked, masked_indices
+        # Randomly choose k between 0 and max_k (inclusive)
+        rng, k_rng = jax.random.split(rng)
+        k = jax.random.randint(k_rng, (), 0, max_k + 1)
+
+        # Always select max_k distinct slot indices (static shape for JIT)
+        perm = jax.random.permutation(rng, num_slots)
+        masked_indices = perm[:max_k]  # [max_k]
+
+        # active_mask: first k entries are active, rest are padding
+        arange = jnp.arange(max_k)
+        active_mask = arange < k  # [max_k] boolean
+
+        # is_slot_masked: mark only the active slots
+        # We loop max_k times (unrolled at JIT compile time since max_k is static)
+        is_slot_masked = jnp.zeros(num_slots, dtype=jnp.bool_)
+        for i in range(max_k):
+            idx = masked_indices[i]
+            is_slot_masked = is_slot_masked.at[idx].set(
+                jnp.logical_or(is_slot_masked[idx], active_mask[i])
+            )
+
+        return is_slot_masked, masked_indices, active_mask
 
     def prepare_input(
         self,
         x: jnp.ndarray,
         rng: jax.Array,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Construct the transformer input by mixing real data with query tokens.
+
+        Uses jnp.where with a boolean mask to avoid dynamic indexing,
+        which is JIT-compatible with a variable number of masked slots.
 
         Logic:
         - t=0: ALWAYS visible (real data) for ALL slots.
@@ -131,20 +162,20 @@ class MaskedSlotPredictor(nn.Module):
 
         Returns:
             full_input: [B, T_total, S, D] — mixed real + query tokens
-            masked_indices: [num_masked_slots] — indices of masked slots
+            masked_indices: [max_masked_slots] — indices of candidate masked slots
+            active_mask: [max_masked_slots] — which entries are actually masked
         """
         B, T_hist, S, D = x.shape
         T_total = self.total_frames
 
         # 1. Get mask indices
-        is_slot_masked, masked_indices = self.get_mask_indices(rng)
+        is_slot_masked, masked_indices, active_mask = self.get_mask_indices(rng)
 
         # 2. Compute anchor queries from t=0
-        # anchors: [B, S, D]
         anchors = x[:, 0, :, :]
         anchor_queries = self.id_projector(anchors)  # [B, S, D]
 
-        # 3. Construct query grid (default for everything)
+        # 3. Construct query grid (default for masked/future positions)
         # mask_token: [1, 1, 1, D] -> broadcast to [B, T_total, S, D]
         # time_pos_embed: [1, T_total, 1, D] -> broadcast to [B, T_total, S, D]
         # anchor_queries: [B, 1, S, D] -> broadcast to [B, T_total, S, D]
@@ -154,36 +185,41 @@ class MaskedSlotPredictor(nn.Module):
             anchor_queries[:, None, :, :]
         )
 
-        # 4. Overwrite visible positions with real data
-        final_input = query_input
+        # 4. Build real-data grid for history positions
+        # real_all: [B, T_hist, S, D] — real slot data + time pos for all slots
+        real_time_pos = x[:, :T_hist, :, :] + self.time_pos_embed[:, :T_hist, :, :]
 
-        # (A) t=0: ALL slots get real data + time_pos_embed[0]
-        final_input = final_input.at[:, 0, :, :].set(
-            x[:, 0, :, :] + self.time_pos_embed[:, 0, :, :]
+        # 5. Create the real-data mask: [1, T_hist, S, 1]
+        #   t=0: ALL slots get real data
+        #   t=1..T_hist-1: unmasked slots get real data, masked slots get query
+        real_mask = jnp.zeros((1, T_hist, S, 1), dtype=jnp.bool_)
+        real_mask = real_mask.at[:, 0, :, :].set(True)  # t=0: all slots real
+        if T_hist > 1:
+            # t>=1: only unmasked slots get real data
+            unmasked = ~is_slot_masked[None, None, :, None]  # [1, 1, S, 1]
+            real_mask = real_mask.at[:, 1:, :, :].set(unmasked)
+
+        # 6. Combine history: where real_mask is True, use real data; else query
+        history_input = jnp.where(
+            real_mask,                            # [1, T_hist, S, 1]
+            real_time_pos,                        # [B, T_hist, S, D]
+            query_input[:, :T_hist, :, :],         # [B, T_hist, S, D]
         )
 
-        # (B) Unmasked slots at history frames (t=1 to T_hist-1) get real data
-        num_unmasked = S - self.num_masked_slots
-        if num_unmasked > 0 and T_hist > 1:
-            # Get unmasked indices with static size
-            unmasked_indices = jnp.where(~is_slot_masked, size=num_unmasked)[0]
-            # real_history: [B, T_hist-1, num_unmasked, D]
-            real_history = x[:, 1:T_hist, :, :][:, :, unmasked_indices, :]
-            # time_pos: [1, T_hist-1, 1, D] -> broadcast
-            history_pos = self.time_pos_embed[:, 1:T_hist, :, :]
-            # Overwrite
-            final_input = final_input.at[:, 1:T_hist, unmasked_indices, :].set(
-                real_history + history_pos
-            )
+        # 7. Future: always query tokens for all slots
+        future_input = query_input[:, T_hist:, :, :]  # [B, T_pred, S, D]
 
-        return final_input, masked_indices
+        # 8. Concatenate
+        final_input = jnp.concatenate([history_input, future_input], axis=1)  # [B, T_total, S, D]
+
+        return final_input, masked_indices, active_mask
 
     def __call__(
         self,
         x: jnp.ndarray,
         rng: Optional[jax.Array] = None,
         training: bool = True,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Training forward pass with masking.
 
         Args:
@@ -193,7 +229,8 @@ class MaskedSlotPredictor(nn.Module):
 
         Returns:
             out: Predicted slots [B, T_total, S, D]
-            masked_indices: [num_masked_slots] indices of masked slots
+            masked_indices: [max_masked_slots] — indices of candidate masked slots
+            active_mask: [max_masked_slots] — which slots are actually masked
         """
         if rng is None:
             rng = jax.random.PRNGKey(0)
@@ -202,7 +239,7 @@ class MaskedSlotPredictor(nn.Module):
         T_total = self.total_frames
 
         # 1. Prepare mixed input
-        x_input, masked_indices = self.prepare_input(x, rng)
+        x_input, masked_indices, active_mask = self.prepare_input(x, rng)
 
         # 2. Flatten (T, S) -> sequence for transformer
         # [B, T_total, S, D] -> [B, T_total * S, D]
@@ -217,7 +254,7 @@ class MaskedSlotPredictor(nn.Module):
         # 5. Output projection
         out = self.to_out(out)
 
-        return out, masked_indices
+        return out, masked_indices, active_mask
 
     def inference(
         self,

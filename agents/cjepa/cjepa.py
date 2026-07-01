@@ -40,7 +40,7 @@ class CJEPA(nn.Module):
         slot_dim: Dimension of slot latent.
         history_frames: Number of history frames.
         pred_frames: Number of future frames to predict.
-        num_masked_slots: Number of slots to mask during training.
+        max_masked_slots: Max number of slots to mask (actual k in [0, max]).
         action_emb_dim: Dimension of action embedding.
         transformer_depth: Depth of non-causal transformer.
         transformer_heads: Number of attention heads.
@@ -51,13 +51,13 @@ class CJEPA(nn.Module):
     num_slots: int
     obj_attr_dim: int
     num_actions: int
-    slot_dim: int = 64
+    slot_dim: int = 128
     history_frames: int = 3
     pred_frames: int = 1
-    num_masked_slots: int = 1
-    action_emb_dim: int = 16
+    max_masked_slots: int = 2
+    action_emb_dim: int = 128
     transformer_depth: int = 6
-    transformer_heads: int = 8
+    transformer_heads: int = 16
     transformer_dim_head: int = 64
     transformer_mlp_dim: int = 2048
     dropout: float = 0.1
@@ -78,14 +78,16 @@ class CJEPA(nn.Module):
             slot_dim=self.slot_dim,
             history_frames=self.history_frames,
             pred_frames=self.pred_frames,
-            num_masked_slots=self.num_masked_slots,
+            max_masked_slots=self.max_masked_slots,
             depth=self.transformer_depth,
             num_heads=self.transformer_heads,
             dim_head=self.transformer_dim_head,
             mlp_dim=self.transformer_mlp_dim,
             dropout=self.dropout,
         )
-        # Action injection projection: project action_emb to slot_dim and add to slots
+        # Action injection: project action_emb to slot_dim and add to slots
+        # In the original Push-T setup, action_emb_dim == slot_dim == 128,
+        # so this is an identity-like learned projection.
         self.action_proj = nn.Dense(
             self.slot_dim,
             kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
@@ -126,28 +128,61 @@ class CJEPA(nn.Module):
         """
         return self.slot_encoder(obs)
 
-    def jepa_loss(
+    def masked_history_loss(
         self,
         predicted: jnp.ndarray,
         targets: jnp.ndarray,
+        T_hist: int,
         masked_indices: jnp.ndarray,
+        active_mask: jnp.ndarray,
     ) -> jnp.ndarray:
-        """Compute JEPA loss: MSE on masked slots only.
+        """MSE on masked slots at history timesteps only.
+
+        This is the C-JEPA core loss: the model must infer masked object
+        states at t=1..T_hist-1 using visible context from other objects.
 
         Args:
             predicted: [B, T_total, S, D]
-            targets: [B, T_total, S, D] (with stop-gradient applied)
-            masked_indices: [num_masked_slots] indices of masked slots
+            targets: [B, T_total, S, D] (with stop-gradient)
+            T_hist: Number of history frames.
+            masked_indices: [max_masked_slots]
+            active_mask: [max_masked_slots]
 
         Returns:
-            loss: scalar MSE on masked slots
+            loss: scalar MSE on active masked slots at history timesteps
         """
-        # Select masked slots across all timesteps
-        pred_masked = predicted[:, :, masked_indices, :]  # [B, T_total, N_masked, D]
-        targ_masked = targets[:, :, masked_indices, :]     # [B, T_total, N_masked, D]
+        # Select candidate masked slots at history timesteps
+        pred_masked = predicted[:, :T_hist, masked_indices, :]  # [B, T_hist, max_k, D]
+        targ_masked = targets[:, :T_hist, masked_indices, :]    # [B, T_hist, max_k, D]
 
-        loss = jnp.mean((pred_masked - targ_masked) ** 2)
+        # Per-slot MSE at each masked position: [max_k]
+        per_slot_mse = jnp.mean((pred_masked - targ_masked) ** 2, axis=(0, 1, 3))
+
+        # Average over active slots only (inactive=padding, ignored)
+        num_active = jnp.maximum(jnp.sum(active_mask), 1)
+        loss = jnp.sum(per_slot_mse * active_mask) / num_active
         return loss
+
+    def future_loss(
+        self,
+        predicted: jnp.ndarray,
+        targets: jnp.ndarray,
+        T_hist: int,
+    ) -> jnp.ndarray:
+        """MSE on ALL slots at future timesteps.
+
+        Always computed regardless of masking — the model must predict
+        future states for all objects.
+
+        Args:
+            predicted: [B, T_total, S, D]
+            targets: [B, T_total, S, D] (with stop-gradient)
+            T_hist: Number of history frames.
+
+        Returns:
+            loss: scalar MSE on all slots at future timesteps
+        """
+        return jnp.mean((predicted[:, T_hist:, :, :] - targets[:, T_hist:, :, :]) ** 2)
 
     def __call__(
         self,
@@ -207,29 +242,56 @@ class CJEPA(nn.Module):
         context_slots = all_slots[:, :T_hist, :, :] + action_proj[:, :T_hist, None, :]
 
         # 5. Predictor: context → predicted for all T_total frames
-        predicted, masked_indices = self.predictor(
+        predicted, masked_indices, active_mask = self.predictor(
             context_slots, rng=rng, training=training
         )
         # predicted: [B, T_total, S, D]
+        # active_mask: [max_masked_slots] — which candidate slots are actually masked
 
-        # 6. JEPA loss on masked slots only
-        loss = self.jepa_loss(predicted, target_slots, masked_indices)
+        # 6a. Future loss: MSE on ALL slots at future timesteps (always present)
+        loss_future = self.future_loss(predicted, target_slots, T_hist)
+
+        # 6b. Masked history loss: MSE on masked slots at history timesteps
+        #   Only computed when slots are actually masked (k > 0).
+        #   This is the core C-JEPA interaction reasoning objective.
+        loss_masked_history = self.masked_history_loss(
+            predicted, target_slots, T_hist, masked_indices, active_mask,
+        )
+
+        # Total loss
+        loss = loss_future + loss_masked_history
+
+        # Number of actually-masked slots (for logging)
+        num_active = jnp.sum(active_mask)
 
         info = {
             'loss': loss,
+            'loss_future': loss_future,
+            'loss_masked_history': loss_masked_history,
             'masked_indices': masked_indices,
+            'num_masked': num_active,
             'predicted_norm': jnp.mean(jnp.abs(predicted)),
             'target_norm': jnp.mean(jnp.abs(target_slots)),
         }
 
-        # Per-slot MSE for debugging
-        for i in range(min(int(self.num_masked_slots), 3)):
-            if i < len(masked_indices):
-                slot_idx = masked_indices[i]
-                slot_mse = jnp.mean(
-                    (predicted[:, :, slot_idx, :] - target_slots[:, :, slot_idx, :]) ** 2
-                )
-                info[f'slot_{int(i)}_mse'] = slot_mse
+        # Log the first active masked slot index (or -1 if none masked)
+        first_active = jnp.where(
+            jnp.any(active_mask),
+            masked_indices[0],
+            -1,
+        )
+        info['masked_slot_0_idx'] = first_active
+
+        # Per-slot MSE at history timesteps for debugging.
+        # NOTE: keys must be STATIC across scan steps, so we index by masked-slot-position
+        # (0, 1, 2), not by actual slot index.
+        for i in range(min(int(self.max_masked_slots), 3)):
+            slot_idx = masked_indices[i]
+            slot_mse = jnp.mean(
+                (predicted[:, :T_hist, slot_idx, :] - target_slots[:, :T_hist, slot_idx, :]) ** 2
+            )
+            # Zero out MSE for inactive (padding) masked slots
+            info[f'slot_{int(i)}_mse'] = jnp.where(active_mask[i], slot_mse, 0.0)
 
         # 7. Auxiliary decoder loss: decode predicted slots back to OC
         #    stop_gradient prevents gradients from flowing to encoder/predictor
@@ -299,7 +361,7 @@ def create_train_state(
     rng: jax.Array,
     sample_obs: jnp.ndarray,
     sample_actions: jnp.ndarray,
-    learning_rate: float = 1e-4,
+    learning_rate: float = 5e-4,
     max_grad_norm: float = 1.0,
 ) -> Tuple[flax.training.train_state.TrainState, Dict]:
     """Create initial training state with optimizer.
@@ -324,7 +386,7 @@ def create_train_state(
 
     tx = optax.chain(
         optax.clip_by_global_norm(max_grad_norm),
-        optax.adam(learning_rate=learning_rate, eps=1e-5),
+        optax.adamw(learning_rate=learning_rate, eps=1e-5, weight_decay=1e-4),
     )
 
     train_state = flax.training.train_state.TrainState.create(

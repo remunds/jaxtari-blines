@@ -23,3 +23,8 @@ override-dependencies = [
     #"flax==0.10.0; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+

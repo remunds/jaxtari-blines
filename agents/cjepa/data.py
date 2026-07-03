@@ -46,10 +46,18 @@ def make_oc_env(env_id: str, frame_stack_size: int = 4, frame_skip: int = 4):
     return env
 
 
-def make_oc_env_single_frame(env_id: str):
-    """Create an environment with per-frame ObjectCentricWrapper (no stacking).
+def make_oc_env_single_frame(env_id: str, frame_skip: int = 1, frame_stack_size: int = 1):
+    """Create an environment with per-frame ObjectCentricWrapper (configurable stacking).
 
-    Returns an env where observation_space is Box(num_features,).
+    Args:
+        env_id: Atari game ID.
+        frame_skip: Number of emulator steps per environment step.
+                    Higher values = wider temporal spacing between observations.
+        frame_stack_size: Number of consecutive frames to stack per observation.
+                          K=1 means single-frame; K>1 means K frames concatenated.
+
+    Returns an env where observation_space is Box(num_features,) after flattening.
+    With frame_stack_size=K, the effective obs_dim = K * num_slots * obj_attr_dim.
     This is used for collecting frame-level trajectories.
     """
     env = jaxatari.make(env_id, mods=None)
@@ -61,11 +69,11 @@ def make_oc_env_single_frame(env_id: str):
         first_fire=True,
         full_action_space=False,
     )
-    # Single-frame OC wrapper
+    # OC wrapper with configurable frame stacking and frameskip
     env = ObjectCentricWrapper(
         env,
-        frame_stack_size=1,
-        frame_skip=1,
+        frame_stack_size=frame_stack_size,
+        frame_skip=frame_skip,
         clip_reward=False,
     )
     env = FlattenObservationWrapper(env)
@@ -73,13 +81,18 @@ def make_oc_env_single_frame(env_id: str):
     return env
 
 
-def get_env_info(env_id: str = "pong") -> Dict:
+def get_env_info(env_id: str = "pong", frame_stack_size: int = 1) -> Dict:
     """Get environment information: num_slots, obj_attr_dim, num_actions.
 
     Creates a single-frame OC env and inspects its observation space.
+    Accounts for frame-stacking when computing obs_dim.
+
+    Args:
+        env_id: Atari game ID.
+        frame_stack_size: Number of consecutive frames stacked per observation.
 
     Returns:
-        Dict with keys: num_slots, obj_attr_dim, num_actions, obs_dim
+        Dict with keys: num_slots, obj_attr_dim, num_actions, obs_dim, stacked_obj_attr_dim
     """
     env = jaxatari.make(env_id, mods=None)
     env = AtariWrapper(
@@ -120,11 +133,13 @@ def get_env_info(env_id: str = "pong") -> Dict:
 
     num_actions = env.action_space().n
 
+    stacked_obj_attr_dim = obj_attr_dim * frame_stack_size
     return {
         "num_slots": num_slots,
         "obj_attr_dim": obj_attr_dim,
         "num_actions": num_actions,
-        "obs_dim": num_slots * obj_attr_dim,
+        "obs_dim": num_slots * stacked_obj_attr_dim,
+        "stacked_obj_attr_dim": stacked_obj_attr_dim,
     }
 
 
@@ -361,6 +376,8 @@ def collect_dataset(
     traj_length: int = 50,
     num_envs: int = 64,
     seed: int = 42,
+    frame_skip: int = 4,
+    frame_stack_size: int = 1,
 ) -> TrajectoryDataset:
     """Collect a dataset of random-policy trajectories.
 
@@ -370,14 +387,16 @@ def collect_dataset(
         traj_length: Length of each trajectory.
         num_envs: Number of parallel environments.
         seed: Random seed.
+        frame_skip: Number of emulator steps per env step (temporal spacing).
 
     Returns:
         TrajectoryDataset.
     """
-    # Create single-frame env for collecting per-step observations
+    # Create env with configurable frame stacking for collecting per-step observations
     # This gives us (obs_dim,) per step (after FlattenObservationWrapper)
-    env = make_oc_env_single_frame(env_id)
-    env_info = get_env_info(env_id)
+    # With frame_stack_size=K, obs_dim = K * num_slots * obj_attr_dim
+    env = make_oc_env_single_frame(env_id, frame_skip=frame_skip, frame_stack_size=frame_stack_size)
+    env_info = get_env_info(env_id, frame_stack_size=frame_stack_size)
     obs_dim = env_info["obs_dim"]
 
     rng = jax.random.PRNGKey(seed)

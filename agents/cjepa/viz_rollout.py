@@ -43,11 +43,27 @@ from agents.cjepa.data import get_env_info, make_oc_env_single_frame
 
 # ── Position extraction from OC observations ──────────────────────────
 
-def extract_positions(oc_obs: np.ndarray) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+OBJ_ATTR_DIM = 8  # x, y, w, h, active, visual_id, state, orientation
+
+
+def extract_positions(oc_obs: np.ndarray, frame_stack_size: int = 1) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     """Extract (x, y) positions for each object from an OC observation.
 
-    OC layout [T, 24]: player(8), enemy(8), ball(8).
-    Each object: x, y, width, height, active, visual_id, state, orientation.
+    The OC observation may contain frame-stacked attributes.
+    With frame_stack_size=K, the observation has shape [T, K * num_slots * 8].
+    The stacking order within the flattened vector is:
+      [oldest_frame_attrs, ..., newest_frame_attrs]
+    where each frame's attrs = [player(8), enemy(8), ball(8)].
+
+    We always extract positions from the **latest** (current) frame,
+    which occupies the last num_slots * 8 elements.
+
+    Args:
+        oc_obs: [T, obs_dim] or [obs_dim] OC observations.
+        frame_stack_size: Number of stacked frames (1 = no stacking).
+
+    Returns:
+        Dict with "player", "enemy", "ball" -> (x_array, y_array).
     """
     was_1d = oc_obs.ndim == 1
     if oc_obs.ndim == 1:
@@ -55,12 +71,20 @@ def extract_positions(oc_obs: np.ndarray) -> Dict[str, Tuple[np.ndarray, np.ndar
     elif oc_obs.ndim == 2:
         oc_obs = oc_obs[None, :, :]
 
-    player_x = np.array(oc_obs[..., 0])
-    player_y = np.array(oc_obs[..., 1])
-    enemy_x = np.array(oc_obs[..., 8])
-    enemy_y = np.array(oc_obs[..., 9])
-    ball_x = np.array(oc_obs[..., 16])
-    ball_y = np.array(oc_obs[..., 17])
+    # Number of objects is always 3 for pong: player, enemy, ball
+    num_objects = 3
+    # The latest frame's attributes are at the end of the stacked vector
+    single_frame_len = num_objects * OBJ_ATTR_DIM  # 24
+    latest_offset = (frame_stack_size - 1) * single_frame_len
+
+    # Index into the latest frame's portion of the observation
+    # Each object has 8 attributes starting at object_idx * 8
+    player_x = np.array(oc_obs[..., latest_offset + 0])
+    player_y = np.array(oc_obs[..., latest_offset + 1])
+    enemy_x = np.array(oc_obs[..., latest_offset + 8])
+    enemy_y = np.array(oc_obs[..., latest_offset + 9])
+    ball_x = np.array(oc_obs[..., latest_offset + 16])
+    ball_y = np.array(oc_obs[..., latest_offset + 17])
 
     player_x, player_y = player_x[0], player_y[0]
     enemy_x, enemy_y = enemy_x[0], enemy_y[0]
@@ -85,16 +109,31 @@ def collect_trajectory(
     env_id: str = "pong",
     num_frames: int = 310,
     seed: int = 42,
+    frame_stack_size: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray, list]:
     """Collect a trajectory from the OC env, tracking raw states for rendering.
 
+    Args:
+        env_id: Atari game ID.
+        num_frames: Number of frames to collect.
+        seed: Random seed.
+        frame_stack_size: Number of stacked frames per observation step.
+                          Must match the value used during training.
+
     Returns:
-        gt_obs: [num_frames, 24] OC observations (object attrs only).
+        gt_obs: [num_frames, obs_dim] OC observations (with frame-stacking).
         gt_actions: [num_frames] discrete actions.
         gt_frames: list of [210, 160, 3] uint8 rendered frames.
     """
     import jaxatari
-    oc_env = make_oc_env_single_frame(env_id)
+    from agents.cjepa.data import get_env_info
+
+    # Compute the correct obs_dim (stripping score dims that JAXtari adds)
+    # The OC wrapper includes 2 extra dims for score_player/score_enemy per frame.
+    env_info = get_env_info(env_id, frame_stack_size=frame_stack_size)
+    obs_dim = env_info["obs_dim"]
+
+    oc_env = make_oc_env_single_frame(env_id, frame_stack_size=frame_stack_size)
     raw_env = jaxatari.make(env_id)
 
     rng = jax.random.PRNGKey(seed)
@@ -123,10 +162,13 @@ def collect_trajectory(
     )
 
     # Convert to numpy
-    gt_obs = np.array(obs_seq)        # [num_frames, obs_dim]
+    gt_obs = np.array(obs_seq)        # [num_frames, raw_obs_dim]
     if gt_obs.ndim == 3 and gt_obs.shape[1] == 1:
         gt_obs = gt_obs[:, 0, :]
-    gt_obs = gt_obs[..., :24]          # Keep only object attrs
+    # Strip score dims (2 per frame) that JAXtari appends to OC observations.
+    # Raw obs has frame_stack_size * (num_slots * 8 + 2) elements.
+    # We keep only the first obs_dim elements (object attributes only).
+    gt_obs = gt_obs[..., :obs_dim]
     gt_actions = np.array(actions_seq)  # [num_frames]
     gt_frames = [np.array(f) for f in frames_seq]  # list of [210, 160, 3]
 
@@ -206,14 +248,34 @@ def plot_trajectories(
         decoded_oc = decoded_oc[:T]
     frames = np.arange(T)
 
-    gt_pos = extract_positions(gt_oc)
+    frame_stack_size = 1 if decoded_oc is None else decoded_oc.shape[-1] // 8
+    gt_pos = extract_positions(gt_oc, frame_stack_size=frame_stack_size)
 
     # Predicted positions: use decoder output if available, else raw slot proxy
+    # decoded_oc has shape [T, S, stacked_obj_attr_dim].
+    # stacked_obj_attr_dim = frame_stack_size * 8.
+    # The latest frame's x,y are at indices 0,1 of the stacked dim
+    # (first slot of the latest frame, which is the last 8 of the stacked dim).
+    # Actually, the decoder decodes the slot back to stacked_obj_attr_dim.
+    # The output is [T, S, K*8].
+    # The ordering is the same as the input: [oldest_frame_attrs, ..., newest_frame_attrs]
+    # within each per-object attribute block.
+    # So for per-object, indices [t, s, (K-1)*8 + 0] = x, [t, s, (K-1)*8 + 1] = y
+    frame_stack_size = 1 if decoded_oc is None else decoded_oc.shape[-1] // 8
+    latest_obj_offset = 0  # the x,y are at the start of each object's own attributes
+    # Actually decoded_oc is per-object, not per-frame. Each object has
+    # stacked_obj_attr_dim = K*8 attributes, representing K frames.
+    # With shape [T, S, K*8], indices for latest frame:
+    #   x: decoded_oc[:, i, (K-1)*8 + 0]
+    #   y: decoded_oc[:, i, (K-1)*8 + 1]
     pred = {}
     for i, obj in enumerate(["player", "enemy", "ball"]):
         if decoded_oc is not None:
-            # Direct screen coordinates from decoder (no normalization needed)
-            pred[obj] = (np.array(decoded_oc[:, i, 0]), np.array(decoded_oc[:, i, 1]))
+            # Latest frame's x,y within per-object stacked attributes
+            latest_x_idx = (frame_stack_size - 1) * 8 + 0
+            latest_y_idx = (frame_stack_size - 1) * 8 + 1
+            pred[obj] = (np.array(decoded_oc[:, i, latest_x_idx]),
+                         np.array(decoded_oc[:, i, latest_y_idx]))
         else:
             # Fallback: normalize raw slot dims 0-1 as position proxy
             px = np.array(pred_slots[:, i, 0])
@@ -499,6 +561,7 @@ def generate_eval_visualizations(
     start_frame: int = 50,
     env_id: str = "pong",
     seed: int = 0,
+    frame_stack_size: int = 1,
 ) -> Dict[str, str]:
     """Generate rollout visualizations for wandb logging during training.
 
@@ -525,6 +588,7 @@ def generate_eval_visualizations(
     # Collect trajectory (OC obs + raw states for rendering)
     gt_obs, gt_actions, gt_frames, gt_states = collect_trajectory(
         env_id=env_id, num_frames=num_frames + start_frame, seed=seed,
+        frame_stack_size=frame_stack_size,
     )
 
     # Run model rollout from start_frame onwards

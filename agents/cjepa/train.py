@@ -125,14 +125,18 @@ def single_run(config: dict):
 
     # Get environment info
     env_id = config["ENV_ID"]
-    env_info = get_env_info(env_id)
+    frame_stack_size = config.get("FRAME_STACK_SIZE", 1)
+    env_info = get_env_info(env_id, frame_stack_size=frame_stack_size)
     num_slots = env_info["num_slots"]
     obj_attr_dim = env_info["obj_attr_dim"]
     num_actions = env_info["num_actions"]
     obs_dim = env_info["obs_dim"]
+    stacked_obj_attr_dim = env_info["stacked_obj_attr_dim"]
     print(f"Environment: {env_id}")
     print(f"  num_slots={num_slots}, obj_attr_dim={obj_attr_dim}, "
-          f"num_actions={num_actions}, obs_dim={obs_dim}")
+          f"num_actions={num_actions}, obs_dim={obs_dim}, "
+          f"frame_stack_size={frame_stack_size}, "
+          f"stacked_obj_attr_dim={stacked_obj_attr_dim}")
 
     # Hyperparameters
     slot_dim = config.get("SLOT_DIM", 128)
@@ -162,6 +166,7 @@ def single_run(config: dict):
     num_val_trajs = int(config.get("NUM_VAL_TRAJECTORIES", 100))
     traj_length = int(config.get("TRAJECTORY_LENGTH", 50))
     num_envs = config.get("NUM_ENVS", 64)
+    frameskip = config.get("FRAMESKIP", 4)
 
     # Create model
     model = CJEPA(
@@ -178,6 +183,7 @@ def single_run(config: dict):
         transformer_dim_head=transformer_dim_head,
         transformer_mlp_dim=transformer_mlp_dim,
         dropout=dropout,
+        frame_stack_size=frame_stack_size,
     )
 
     T_total = history_frames + pred_frames
@@ -202,6 +208,8 @@ def single_run(config: dict):
         traj_length=traj_length,
         num_envs=num_envs,
         seed=int(jax.random.randint(data_rng, (), 0, 2**31 - 1)),
+        frame_skip=frameskip,
+        frame_stack_size=frame_stack_size,
     )
     print(f"  Training windows: {train_dataset.num_windows}")
 
@@ -214,6 +222,8 @@ def single_run(config: dict):
         traj_length=traj_length,
         num_envs=num_envs,
         seed=int(jax.random.randint(val_data_rng, (), 0, 2**31 - 1)),
+        frame_skip=frameskip,
+        frame_stack_size=frame_stack_size,
     )
     print(f"  Validation windows: {val_dataset.num_windows}")
 
@@ -346,6 +356,7 @@ def single_run(config: dict):
                             step=step, output_dir=viz_dir,
                             num_frames=viz_frames, start_frame=viz_start_frame,
                             env_id=env_id, seed=step + 42,
+                            frame_stack_size=frame_stack_size,
                         )
                         wandb.log({
                             "eval/trajectories": wandb.Image(viz_paths["trajectory_plot"]),

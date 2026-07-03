@@ -1,7 +1,8 @@
 """C-JEPA world model — combines all components into a single model.
 
 Architecture:
-    OC observation [B, T, obj_attr_dim * num_objects]
+    OC observation [B, T, stacked_obj_attr_dim * num_objects]
+    where stacked_obj_attr_dim = obj_attr_dim * frame_stack_size
         │
         ▼
     SlotEncoder → slots [B, T, S, slot_dim]
@@ -62,12 +63,14 @@ class CJEPA(nn.Module):
     transformer_mlp_dim: int = 2048
     dropout: float = 0.1
     decoder_loss_weight: float = 1.0
+    frame_stack_size: int = 1
 
     def setup(self):
         self.slot_encoder = SlotEncoder(
             num_slots=self.num_slots,
             obj_attr_dim=self.obj_attr_dim,
             slot_dim=self.slot_dim,
+            frame_stack_size=self.frame_stack_size,
         )
         self.action_encoder = ActionEncoder(
             num_actions=self.num_actions,
@@ -97,6 +100,7 @@ class CJEPA(nn.Module):
         self.decoder = SlotDecoder(
             slot_dim=self.slot_dim,
             obj_attr_dim=self.obj_attr_dim,
+            frame_stack_size=self.frame_stack_size,
         )
 
     def decode_slots(
@@ -295,9 +299,10 @@ class CJEPA(nn.Module):
 
         # 7. Auxiliary decoder loss: decode predicted slots back to OC
         #    stop_gradient prevents gradients from flowing to encoder/predictor
-        decoded = self.decoder(jax.lax.stop_gradient(predicted))  # [B, T, S, obj_attr_dim]
-        # Reshape GT obs to match: [B, T, S, obj_attr_dim]
-        gt_oc = obs.reshape(*obs.shape[:2], self.num_slots, self.obj_attr_dim)
+        decoded = self.decoder(jax.lax.stop_gradient(predicted))  # [B, T, S, stacked_obj_attr_dim]
+        # Reshape GT obs to match: [B, T, S, stacked_obj_attr_dim]
+        stacked_dim = self.obj_attr_dim * self.frame_stack_size
+        gt_oc = obs.reshape(*obs.shape[:2], self.num_slots, stacked_dim)
         decoder_loss = jnp.mean((decoded - gt_oc) ** 2)
         info['decoder_loss'] = decoder_loss
         # Decoder loss only updates decoder params (source inputs are stop_gradient'd)

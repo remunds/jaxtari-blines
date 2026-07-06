@@ -17,9 +17,10 @@ class SeaquestRm(GameRM):
         "at_surface_idle": 6,
     }
 
+    #   lost_life > diver_collected > scored > surfaced > at_surface_idle
     TRANSITIONS = [
         # State 0: 0 divers
-        {"from": 0, "true": ["lost_life"], "to": 0, "reward": -0.5},                                # t0
+        {"from": 0, "true": ["lost_life"], "to": 0, "reward": -0.3},                                # t0
         {"from": 0, "true": ["diver_collected"], "to": 1, "reward": 1.0},                           # t1
         {"from": 0, "true": ["scored"], "false": ["diver_collected", "surfaced"], "to": 0, "reward": 0.5},  # t2
         {"from": 0, "true": ["surfaced"], "false": ["diver_collected"], "to": 0, "reward": -0.5},   # t3
@@ -33,35 +34,35 @@ class SeaquestRm(GameRM):
         {"from": 1, "true": ["at_surface_idle"], "false": ["lost_life", "diver_collected", "scored", "surfaced"], "to": 1, "reward": -0.02},  # t9
 
         # State 2: 2 divers
-        {"from": 2, "true": ["lost_life"], "to": 1, "reward": -0.5},                                # t10
+        {"from": 2, "true": ["lost_life"], "to": 1, "reward": -0.7},                                # t10
         {"from": 2, "true": ["diver_collected"], "to": 3, "reward": 1.0},                           # t11
         {"from": 2, "true": ["scored"], "false": ["diver_collected", "surfaced"], "to": 2, "reward": 0.5},  # t12
         {"from": 2, "true": ["surfaced"], "false": ["diver_collected"], "to": 1, "reward": 0.0},    # t13
         {"from": 2, "true": ["at_surface_idle"], "false": ["lost_life", "diver_collected", "scored", "surfaced"], "to": 2, "reward": -0.02},  # t14
 
         # State 3: 3 divers
-        {"from": 3, "true": ["lost_life"], "to": 2, "reward": -0.5},                                # t15
+        {"from": 3, "true": ["lost_life"], "to": 2, "reward": -1.0},                                # t15
         {"from": 3, "true": ["diver_collected"], "to": 4, "reward": 1.0},                           # t16
         {"from": 3, "true": ["scored"], "false": ["diver_collected", "surfaced"], "to": 3, "reward": 0.5},  # t17
         {"from": 3, "true": ["surfaced"], "false": ["diver_collected"], "to": 2, "reward": 0.0},    # t18
         {"from": 3, "true": ["at_surface_idle"], "false": ["lost_life", "diver_collected", "scored", "surfaced"], "to": 3, "reward": -0.02},  # t19
 
         # State 4: 4 divers
-        {"from": 4, "true": ["lost_life"], "to": 3, "reward": -0.5},                                # t20
+        {"from": 4, "true": ["lost_life"], "to": 3, "reward": -1.3},                                # t20
         {"from": 4, "true": ["diver_collected"], "to": 5, "reward": 1.0},                           # t21
         {"from": 4, "true": ["scored"], "false": ["diver_collected", "surfaced"], "to": 4, "reward": 0.5},  # t22
         {"from": 4, "true": ["surfaced"], "false": ["diver_collected"], "to": 3, "reward": 0.0},    # t23
         {"from": 4, "true": ["at_surface_idle"], "false": ["lost_life", "diver_collected", "scored", "surfaced"], "to": 4, "reward": -0.02},  # t24
 
         # State 5: 5 divers
-        {"from": 5, "true": ["lost_life"], "to": 4, "reward": -0.5},                                # t25
+        {"from": 5, "true": ["lost_life"], "to": 4, "reward": -1.6},                                # t25
         {"from": 5, "true": ["diver_collected"], "to": 6, "reward": 1.0},                           # t26
         {"from": 5, "true": ["scored"], "false": ["diver_collected", "surfaced"], "to": 5, "reward": 0.5},  # t27
         {"from": 5, "true": ["surfaced"], "false": ["diver_collected"], "to": 4, "reward": 0.0},    # t28
         {"from": 5, "true": ["at_surface_idle"], "false": ["lost_life", "diver_collected", "scored", "surfaced"], "to": 5, "reward": -0.02},  # t29
 
         # State 6: 6 divers — goal.
-        {"from": 6, "true": ["lost_life"], "to": 5, "reward": -0.5},                                # t30
+        {"from": 6, "true": ["lost_life"], "to": 5, "reward": -2.0},                                # t30
         {"from": 6, "true": ["scored"], "false": ["surfaced"], "to": 6, "reward": 0.5},             # t31
         {"from": 6, "true": ["surfaced"], "to": 0, "reward": 10.0},                                 # t32
         {"from": 6, "true": ["at_surface_idle"], "false": ["lost_life", "scored", "surfaced"], "to": 6, "reward": -0.02},  # t33
@@ -110,7 +111,11 @@ class SeaquestRm(GameRM):
         surfaced        = (player_y_now < (46.5 / 210.0)) & (player_y_prev > player_y_now)    # player_y == 46 → at surface
         dove            = (player_y_prev <= (52 / 210.0)) & (player_y_prev < player_y_now) & oxygen_full
         diver_collected = divers_now > divers_prev
-        at_surface_idle = (player_y_now <= (46.5 / 210.0)) & oxygen_full & ~surfaced
+        # Fires every frame while sitting at the surface with full oxygen —
+        # i.e. nothing left to refill, no reason to stay up. Lowest priority
+        # event, used as a per-step penalty against the "stay at surface"
+        # local optimum.
+        at_surface_idle = (player_y_now <= (46.5 / 210.0)) & oxygen_full
 
         return jnp.array([
             lost_life,

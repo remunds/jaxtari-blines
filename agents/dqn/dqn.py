@@ -97,104 +97,6 @@ class QNetwork(nn.Module):
         x = nn.Dense(self.action_dim)(x)
         return x
 
-# class MLP_QNetwork(nn.Module):
-#     action_dim: int
-#
-#     @nn.compact
-#     def __call__(self, x):
-#         x = nn.Dense(461, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-#         x = nn.relu(x)
-#         x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-#         x = nn.relu(x)
-#         x = nn.Dense(self.action_dim, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
-#         return x
-
-
-class DQNTrainState(TrainState):
-    target_params: flax.core.FrozenDict
-
-
-@flax.struct.dataclass
-class EpisodeStatistics: 
-    episode_returns: jnp.array
-    episode_lengths: jnp.array
-    returned_episode_returns: jnp.array
-    returned_episode_lengths: jnp.array
-
-
-def build_eval_fn(env, apply_fn, eval_episodes, max_steps, action_dim):
-   
-
-    def wrapped_reset(key):
-        next_obs, state = env.reset(key)
-        return next_obs.squeeze()[None, ...], state
-
-    def wrapped_step(state, action):
-        next_obs, next_state, reward, terminated, truncated, info = env.step(state, action.squeeze())
-        done = jnp.logical_or(terminated, truncated)
-        return next_obs.squeeze()[None, ...], next_state, reward, done, info
-
-    def get_action(params, obs, key, epsilon):
-        q_values = apply_fn(params, obs)
-        greedy_action = jnp.argmax(q_values, axis=1)
-
-        key, subkey = jax.random.split(key)
-        random_action = jax.random.randint(subkey, greedy_action.shape, 0, action_dim)
-        explore = jax.random.uniform(key, greedy_action.shape) < epsilon
-        action = jnp.where(explore, random_action, greedy_action)
-        return action, key
-
-    def step_fn(carry, _):
-        obs, env_state, keys, params, epsilon = carry
-
-        actions, keys = jax.vmap(get_action, in_axes=(None, 0, 0, None))(params, obs, keys, epsilon)
-        next_obs, next_env_state, reward, done, info = jax.vmap(wrapped_step)(env_state, actions)
-        first_state = jax.tree.map(lambda x: x[0], next_env_state)
-
-        return (next_obs, next_env_state, keys, params, epsilon), (first_state, done, reward)
-
-    @jax.jit
-    def eval_fn(params, reset_keys, epsilon):
-        obs, env_state = jax.vmap(wrapped_reset)(reset_keys)
-
-        _, (first_states_history, dones, rewards) = jax.lax.scan(
-            step_fn, (obs, env_state, reset_keys, params, epsilon), None, length=max_steps)
-        has_finished = jax.lax.cummax(dones.astype(jnp.int32), axis=0)
-        mask_after_first_done = jnp.pad(has_finished[:-1, :], ((1, 0), (0, 0)), constant_values=0)
-        masked_rewards = rewards * (1 - mask_after_first_done)
-        episodic_returns = jnp.sum(masked_rewards, axis=0)
-
-        first_done = jnp.argmax(dones, axis=0)
-        return episodic_returns, first_states_history, first_done
-
-    return eval_fn
-
-
-def single_run(config: dict):
-    config = {k.upper(): v for k, v in config.items() if k != "alg"}
-
-    if isinstance(config.get("TRAIN_MODS"), list):
-        config["TRAIN_MODS"] = tuple(config["TRAIN_MODS"])
-    if isinstance(config.get("EVAL_MODS"), list):
-        config["EVAL_MODS"] = tuple(config["EVAL_MODS"])
-
-    if config.get("PIXEL_BASED", True) and config.get("NUM_ENVS", 1) > 16:
-        config["NUM_ENVS"] = 8
-
-    run_name = f"{config["ENV_ID"]}_{config["EXP_NAME"]}_{"oc" if not config["PIXEL_BASED"] else "pixel"}_{config["SEED"]}"
-
-    wandb.init(
-        project=config.get("PROJECT", "jaxtari-blines"),
-        entity=config.get("ENTITY", None),
-    )
-
-@chex.dataclass(frozen=True)
-class TimeStep:
-    obs: chex.Array
-    action: chex.Array
-    reward: chex.Array
-    done: chex.Array
-
 class CustomTrainState(TrainState):
     target_network_params: flax.core.FrozenDict
     timesteps: int
@@ -235,16 +137,18 @@ def dqn_run(config: dict):
         False,
         game_rm)()
 
+    obs_shape = env.observation_space().shape
+
     @jax.jit
     def vmap_reset(key):
         obs, state = jax.vmap(env.reset)(key)
-        return obs.squeeze(), state
+        return obs.reshape(key.shape[0], *obs_shape), state
     
     @jax.jit
     def vmap_step(state, action):
         next_obs, state, reward, terminated, truncated, info = jax.vmap(env.step)(state, action)
         next_done = jnp.logical_or(terminated, truncated)
-        return next_obs.squeeze(), state, reward, next_done, info
+        return next_obs.reshape(action.shape[0], *obs_shape), state, reward, next_done, info
 
     key, _rng = jax.random.split(key)
     init_obs, env_state = vmap_reset(jax.random.split(_rng, config["NUM_ENVS"]))

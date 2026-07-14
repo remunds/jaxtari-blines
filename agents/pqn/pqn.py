@@ -278,54 +278,61 @@ def single_run(config: dict) -> dict:
 
     avg_returns = deque(maxlen=20)
     start_time = time.time()
+    num_iterations = total_timesteps // batch_size
 
-    CHUNK_ITERS = int(config.get("CHUNK_ITERS", 32))
-
-    def one_iteration(carry, _):
-        q_state, env_states, next_obs, next_done, key, global_step = carry
+    def _update_step(runner_state, _):
+        q_state, env_states, next_obs, next_done, key, global_step = runner_state
         (_, env_states, next_obs, next_done, key, global_step), storage, infos = rollout(
             q_state.params, env_states, next_obs, next_done, key, global_step
         )
         storage = compute_q_lambda(q_state, next_obs, next_done, storage)
         q_state, loss, q_val, key = update_pqn(q_state, storage, key)
-        out = (infos["returned_episode"], infos["returned_episode_returns"],
-               loss[-1, -1], q_val[-1, -1])
-        return (q_state, env_states, next_obs, next_done, key, global_step), out
+
+        epsilon = jnp.maximum(
+            end_e,
+            start_e + (end_e - start_e) * global_step.astype(jnp.float32) / exploration_steps,
+        )
+        metrics = {
+            "global_step": global_step,
+            "epsilon": epsilon,
+            "td_loss": loss[-1, -1],
+            "q_values": q_val[-1, -1],
+            "ep_returns": infos["returned_episode_returns"],
+            "finished": infos["returned_episode"],
+        }
+
+        def _log_cb(m):
+            gs = int(m["global_step"])
+            elapsed = time.time() - start_time
+            sps = int(gs / elapsed) if elapsed > 0 else 0
+            logd = {
+                "charts/global_step": gs,
+                "charts/epsilon": float(m["epsilon"]),
+                "charts/SPS": sps,
+                "losses/td_loss": float(m["td_loss"]),
+                "losses/q_values": float(m["q_values"]),
+            }
+            fin = np.asarray(m["finished"]).reshape(-1).astype(bool)
+            rets = np.asarray(m["ep_returns"]).reshape(-1)
+            vals = rets[fin]
+            if vals.size:
+                for v in vals:
+                    avg_returns.append(float(v))
+                logd["charts/episodic_return"] = float(vals.mean())
+                logd["charts/avg_episodic_return"] = float(np.mean(avg_returns))
+            wandb.log(logd, step=gs)
+
+        jax.debug.callback(_log_cb, metrics)
+        return (q_state, env_states, next_obs, next_done, key, global_step), None
 
     @jax.jit
-    def train_chunk(carry):
-        return jax.lax.scan(one_iteration, carry, None, length=CHUNK_ITERS)
+    def train(runner_state):
+        return jax.lax.scan(_update_step, runner_state, None, length=num_iterations)
 
-    carry = (q_state, env_states, next_obs, next_done, key, jnp.int32(0))
-    num_chunks = num_iterations // CHUNK_ITERS
-    print(f"[PQN] chunked training: {num_chunks} chunks x {CHUNK_ITERS} iters "
-          f"({CHUNK_ITERS * batch_size} steps/chunk)")
-
-    for chunk in range(1, num_chunks + 1):
-        carry, (fin, rets, losses, qvals) = train_chunk(carry)
-        q_state = carry[0]
-        gs = int(carry[5])
-        fin = np.array(fin).reshape(-1)
-        rets = np.array(rets).reshape(-1)
-        ep = rets[fin]
-        for r in ep[-20:]:
-            avg_returns.append(float(r))
-        epsilon = float(max(end_e, start_e + (end_e - start_e) * gs / exploration_steps))
-        sps = int(gs / (time.time() - start_time))
-        logd = {
-            "charts/global_step": gs,
-            "charts/epsilon": epsilon,
-            "charts/SPS": sps,
-            "losses/td_loss": float(np.array(losses)[-1]),
-            "losses/q_values": float(np.array(qvals)[-1]),
-        }
-        if ep.size:
-            logd["charts/episodic_return"] = float(ep.mean())
-            logd["charts/avg_episodic_return"] = float(np.mean(avg_returns))
-        wandb.log(logd, step=gs)
-        if chunk % max(1, num_chunks // 20) == 0:
-            print(f"step: {gs}/{total_timesteps} | SPS: {sps} | "
-                  f"avg_return: {np.mean(avg_returns) if avg_returns else 0:.2f}")
+    runner_state = (q_state, env_states, next_obs, next_done, key, jnp.int32(0))
+    print(f"[PQN] fully-scanned training: {num_iterations} iterations ({batch_size} steps/iter)")
+    runner_state, _ = jax.block_until_ready(train(runner_state))
+    q_state = runner_state[0]
 
     model_path = None
     if save_path is not None:

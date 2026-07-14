@@ -416,44 +416,62 @@ def single_run(config: dict):
     global_step = jnp.array(0, dtype=jnp.int32)
 
     carry = (agent_state, buffer_state, env_state, obs, key, global_step, episode_stats)
-
     start_time = time.time()
-    total_eval_time = 0.0
     total_iterations = config.get("TOTAL_TIMESTEPS", 10000000) // (num_envs * CHUNK_SIZE)
+    eval_every = config.get("EVAL_EVERY", 10)
+    eval_during = bool(config.get("EVAL_DURING_TRAIN", True))
+    print(f"[C51] fully-scanned training: {total_iterations} chunks x {CHUNK_SIZE} steps")
 
-    print(f"starting compilation and run ({total_iterations} chunks of {CHUNK_SIZE * num_envs} steps)")
+    def _eval_mean(params, step_count):
+        reset_keys = jax.random.split(jax.random.PRNGKey(config["SEED"] + step_count), eval_episodes)
+        episodic_returns, _, _ = eval_fn(params, reset_keys, 0.05)
+        return jnp.mean(episodic_returns)
 
-    for i in range(1, total_iterations + 1):
-        iteration_time_start = time.time()
-        carry, losses = rollout_chunk(carry)
+    eps_x = jnp.array([0.0, config.get("EXPLORATION_FRACTION", 0.10) * config.get("TOTAL_TIMESTEPS", 10000000)])
+    eps_y = jnp.array([config.get("START_E", 1.0), config.get("END_E", 0.01)])
+
+    def _outer_step(carry, i):
+        carry, losses = jax.lax.scan(step_once, carry, None, length=CHUNK_SIZE)
         agent_state, buffer_state, env_state, obs, key, global_step, episode_stats = carry
-
-        current_step = global_step.item()
-        iteration_time = time.time() - iteration_time_start
-
-        if config.get("EVAL_DURING_TRAIN", True) and (i % config.get("EVAL_EVERY", 10) == 0):
-            eval_t0 = time.time()
-            save_and_eval(current_step, agent_state)
-            total_eval_time += time.time() - eval_t0
-
+        do_eval = jnp.logical_and(eval_during, ((i + 1) % eval_every) == 0)
+        eval_ret = jax.lax.cond(
+            do_eval,
+            lambda: _eval_mean(agent_state.params, global_step),
+            lambda: jnp.array(jnp.nan, dtype=jnp.float32),
+        )
         metrics = {
-            "charts/avg_episodic_return": episode_stats.returned_episode_returns.mean().item(),
-            "charts/avg_episodic_length": episode_stats.returned_episode_lengths.mean().item(),
-            "charts/epsilon": float(jnp.interp(
-                current_step,
-                jnp.array([0, config.get("EXPLORATION_FRACTION", 0.10) * config.get("TOTAL_TIMESTEPS", 10000000)]),
-                jnp.array([config.get("START_E", 1.0), config.get("END_E", 0.01)]),
-            )),
-            "charts/SPS": int(current_step / (time.time() - start_time - total_eval_time)),
-            "charts/SPS_update": int(CHUNK_SIZE * num_envs / iteration_time),
-            "losses/td_loss": float(jnp.mean(losses)),
-            "charts/global_step": current_step,
+            "avg_episodic_return": episode_stats.returned_episode_returns.mean(),
+            "avg_episodic_length": episode_stats.returned_episode_lengths.mean(),
+            "epsilon": jnp.interp(global_step.astype(jnp.float32), eps_x, eps_y),
+            "td_loss": jnp.mean(losses),
+            "global_step": global_step,
+            "eval_return": eval_ret,
         }
-        wandb.log(metrics, step=current_step)
+        def _log_cb(m):
+            gs = int(m["global_step"])
+            elapsed = time.time() - start_time
+            sps = int(gs / elapsed) if elapsed > 0 else 0
+            logd = {
+                "charts/avg_episodic_return": float(m["avg_episodic_return"]),
+                "charts/avg_episodic_length": float(m["avg_episodic_length"]),
+                "charts/epsilon": float(m["epsilon"]),
+                "charts/SPS": sps,
+                "losses/td_loss": float(m["td_loss"]),
+                "charts/global_step": gs,
+            }
+            ev = float(m["eval_return"])
+            if not np.isnan(ev):
+                logd["charts/episodic_return"] = ev
+            wandb.log(logd, step=gs)
+        jax.debug.callback(_log_cb, metrics)
+        return carry, None
 
-        if i % (max(1, total_iterations // 20)) == 0:
-            sps = int(current_step / (time.time() - start_time - total_eval_time))
-            print(f"step: {current_step} / {config.get('TOTAL_TIMESTEPS')} | SPS: {sps} | return: {episode_stats.returned_episode_returns.mean().item():.2f}")
+    @jax.jit
+    def train(carry):
+        return jax.lax.scan(_outer_step, carry, jnp.arange(total_iterations))
+
+    carry, _ = jax.block_until_ready(train(carry))
+    agent_state = carry[0]
 
     save_and_eval(config.get("TOTAL_TIMESTEPS", 10000000), agent_state)
     wandb.finish()

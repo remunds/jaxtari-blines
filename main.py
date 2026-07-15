@@ -22,6 +22,12 @@ def main(config):
         elif merged_config["ALG"] == "PQN":
             from agents.pqn.pqn import single_run
             run_fn = single_run
+        elif merged_config["ALG"] == "DDPG":
+            from agents.ddpg.ddpg import single_run
+            run_fn = single_run
+        elif merged_config["ALG"] == "CROSSQ":
+            from agents.crossq.crossq import single_run
+            run_fn = single_run
 
         print(f"Running seed {seed} ...")
         merged_config["SEED"] = seed

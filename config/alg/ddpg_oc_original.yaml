@@ -1,0 +1,24 @@
+ALG: DDPG
+EXP_NAME: ddpg
+
+PIXEL_BASED: False
+NATIVE_DOWNSCALING: True
+NUM_ENVS: 1
+
+TOTAL_TIMESTEPS: 10000000
+BUFFER_SIZE: 200000
+LEARNING_STARTS: 10000
+CHUNK_SIZE: 1000
+
+ACTOR_LR: 0.0003
+CRITIC_LR: 0.0003
+BATCH_SIZE: 32
+TRAIN_FREQUENCY: 4
+GAMMA: 0.99
+TAU: 0.005          # polyak coefficient for soft target updates
+GUMBEL_TAU: 1.0     # temperature for categorical exploration sampling
+
+EVAL_EVERY: 10
+SAVE_PATH: ./models
+
+RUN_NAME: v1_ddpg_oc_original

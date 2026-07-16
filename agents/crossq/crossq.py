@@ -359,10 +359,10 @@ def single_run(config: dict):
 
     # entropy temperature (autotuned, discrete target entropy as in cleanrl sac_atari)
     target_entropy = -config.get("TARGET_ENTROPY_SCALE", 0.89) * jnp.log(1.0 / action_dim)
-    log_alpha = jnp.zeros(())
+    # params must be a (frozen)dict for TrainState.apply_gradients, not a bare scalar
     alpha_state = TrainState.create(
-        apply_fn=lambda params, _=None: params,  # dummy; params IS log_alpha
-        params=log_alpha,
+        apply_fn=lambda params, _=None: params,  # dummy
+        params={"log_alpha": jnp.zeros(())},
         tx=optax.adam(learning_rate=config.get("ALPHA_LR", 3e-4), b1=adam_b1),
     )
 
@@ -434,7 +434,7 @@ def single_run(config: dict):
     updates_per_step = max(1, num_envs // config.get("TRAIN_FREQUENCY", 4))
 
     def update(actor_state, critic_state, alpha_state, b_obs, b_act, b_nobs, b_rew, b_don):
-        alpha = jnp.exp(alpha_state.params)
+        alpha = jnp.exp(alpha_state.params["log_alpha"])
 
         # policy distribution at s' (for the soft target)
         next_logits = actor.apply(actor_state.params, b_nobs)
@@ -488,8 +488,8 @@ def single_run(config: dict):
         probs = jax.lax.stop_gradient(probs)
         logp = jax.lax.stop_gradient(logp)
 
-        def alpha_loss_fn(log_alpha_param):
-            return jnp.mean(jnp.sum(probs * (-jnp.exp(log_alpha_param) * (logp + target_entropy)), axis=-1))
+        def alpha_loss_fn(alpha_params):
+            return jnp.mean(jnp.sum(probs * (-jnp.exp(alpha_params["log_alpha"]) * (logp + target_entropy)), axis=-1))
 
         alpha_loss, alpha_grads = jax.value_and_grad(alpha_loss_fn)(alpha_state.params)
         alpha_state = alpha_state.apply_gradients(grads=alpha_grads)
@@ -635,7 +635,7 @@ def single_run(config: dict):
             "charts/global_step": global_step,
             "charts/avg_episodic_return": ep_stats.returned_episode_returns.mean(),
             "charts/avg_episodic_length": ep_stats.returned_episode_lengths.mean().astype(jnp.float32),
-            "charts/alpha": jnp.exp(alpha_state.params),
+            "charts/alpha": jnp.exp(alpha_state.params["log_alpha"]),
             "losses/critic_loss": avg_critic_loss,
             "losses/actor_loss": avg_actor_loss,
         }

@@ -143,7 +143,7 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    """DQN-style critic: Q(s, .) for all discrete actions."""
+    """DQN-style critic: Q(s, .) for all discrete actions (VARIANT: expected_q)."""
     action_dim: int
     pixel_based: bool
 
@@ -151,6 +151,22 @@ class Critic(nn.Module):
     def __call__(self, x):
         x = PixelTorso()(x) if self.pixel_based else OCTorso()(x)
         return nn.Dense(self.action_dim)(x)
+
+
+class CriticAction(nn.Module):
+    """Continuous-DDPG-style critic: Q(s, a) with the action as a one-hot input
+    (VARIANT: gumbel_st, following MADDPG's discrete handling, Lowe et al. 2017).
+    Actor gradients flow through a straight-through Gumbel-softmax sample into
+    this critic — the faithful discrete analog of the deterministic policy gradient."""
+    pixel_based: bool
+
+    @nn.compact
+    def __call__(self, x, a_onehot):
+        x = PixelTorso()(x) if self.pixel_based else OCTorso()(x)
+        x = jnp.concatenate([x, a_onehot], axis=-1)
+        x = nn.Dense(256)(x)
+        x = nn.relu(x)
+        return nn.Dense(1)(x).squeeze(-1)
 
 
 class DDPGTrainState(TrainState):
@@ -303,13 +319,25 @@ def single_run(config: dict):
         next_done = jnp.logical_or(terminated, truncated)
         return next_obs.reshape(action.shape[0], *obs_shape), state, reward, next_done, info
 
+    # "gumbel_st": Q(s,a)-critic + straight-through Gumbel-softmax actor gradient
+    #              with annealed temperature (MADDPG-style, the faithful adaptation).
+    # "expected_q": original variant — Q(s,.)-critic, actor maximizes E_pi[Q].
+    #              Kept for the ablation record; it failed to learn on pong.
+    variant = str(config.get("VARIANT", "gumbel_st")).lower()
+    tau_start = float(config.get("GUMBEL_TAU_START", 2.0))
+    tau_end = float(config.get("GUMBEL_TAU_END", 0.5))
+
     key, actor_key, critic_key = jax.random.split(key, 3)
     actor = Actor(action_dim=action_dim, pixel_based=pixel_based)
-    critic = Critic(action_dim=action_dim, pixel_based=pixel_based)
 
     dummy_obs = jnp.zeros((1, *obs_shape))
     actor_params = actor.init(actor_key, dummy_obs)
-    critic_params = critic.init(critic_key, dummy_obs)
+    if variant == "gumbel_st":
+        critic = CriticAction(pixel_based=pixel_based)
+        critic_params = critic.init(critic_key, dummy_obs, jnp.zeros((1, action_dim)))
+    else:
+        critic = Critic(action_dim=action_dim, pixel_based=pixel_based)
+        critic_params = critic.init(critic_key, dummy_obs)
 
     actor_state = DDPGTrainState.create(
         apply_fn=actor.apply,
@@ -429,6 +457,43 @@ def single_run(config: dict):
         )
         return actor_state, critic_state, critic_loss, actor_loss
 
+    def update_gumbel_st(actor_state, critic_state, b_obs, b_act, b_nobs, b_rew, b_don, gumbel_key, tau_now):
+        # --- critic update: Q(s, onehot(a)) with deterministic target policy ---
+        next_logits = actor.apply(actor_state.target_params, b_nobs)
+        next_onehot = jax.nn.one_hot(jnp.argmax(next_logits, axis=-1), action_dim)
+        next_q = critic.apply(critic_state.target_params, b_nobs, next_onehot)
+        y = jax.lax.stop_gradient(b_rew + gamma * (1.0 - b_don) * next_q)
+
+        def critic_loss_fn(params):
+            q_pred = critic.apply(params, b_obs, jax.nn.one_hot(b_act, action_dim))
+            return jnp.mean((q_pred - y) ** 2)
+
+        critic_loss, critic_grads = jax.value_and_grad(critic_loss_fn)(critic_state.params)
+        critic_state = critic_state.apply_gradients(grads=critic_grads)
+
+        # --- actor update: straight-through Gumbel-softmax through the critic ---
+        u = jax.random.uniform(gumbel_key, (batch_size, action_dim), minval=1e-6, maxval=1.0 - 1e-6)
+        g = -jnp.log(-jnp.log(u))
+
+        def actor_loss_fn(params):
+            logits = actor.apply(params, b_obs)
+            y_soft = jax.nn.softmax((logits + g) / tau_now, axis=-1)
+            y_hard = jax.nn.one_hot(jnp.argmax(y_soft, axis=-1), action_dim)
+            y_st = y_hard + y_soft - jax.lax.stop_gradient(y_soft)  # forward hard, backward soft
+            return -jnp.mean(critic.apply(critic_state.params, b_obs, y_st))
+
+        actor_loss, actor_grads = jax.value_and_grad(actor_loss_fn)(actor_state.params)
+        actor_state = actor_state.apply_gradients(grads=actor_grads)
+
+        # --- soft target updates ---
+        critic_state = critic_state.replace(
+            target_params=optax.incremental_update(critic_state.params, critic_state.target_params, polyak_tau)
+        )
+        actor_state = actor_state.replace(
+            target_params=optax.incremental_update(actor_state.params, actor_state.target_params, polyak_tau)
+        )
+        return actor_state, critic_state, critic_loss, actor_loss
+
     def step_once(carry, _):
         actor_state, critic_state, buffer_state, env_state, obs, rng, global_step, ep_stats = carry
 
@@ -442,8 +507,15 @@ def single_run(config: dict):
             jnp.array([0, config.get("EXPLORATION_FRACTION", 0.10) * config.get("TOTAL_TIMESTEPS", 10000000)]),
             jnp.array([config.get("START_E", 1.0), config.get("END_E", 0.01)]),
         )
+        # annealed sampling temperature (gumbel_st); fixed for the legacy variant
+        tau_now = jnp.interp(
+            global_step.astype(jnp.float32),
+            jnp.array([0.0, float(config.get("TOTAL_TIMESTEPS", 10000000))]),
+            jnp.array([tau_start, tau_end]),
+        )
+        tau_act = tau_now if variant == "gumbel_st" else gumbel_tau
         logits = actor.apply(actor_state.params, obs)
-        gumbel_actions = jax.random.categorical(action_rng, logits / gumbel_tau, axis=-1)
+        gumbel_actions = jax.random.categorical(action_rng, logits / tau_act, axis=-1)
         random_actions = jax.random.randint(rand_rng, (num_envs,), 0, action_dim)
         explore_mask = jax.random.uniform(eps_rng, (num_envs,)) < epsilon
         actions = jnp.where(explore_mask, random_actions, gumbel_actions)
@@ -470,9 +542,9 @@ def single_run(config: dict):
 
         def do_update(update_carry, _):
             a_state, c_state, u_key = update_carry
-            u_key, sample_key = jax.random.split(u_key)
+            u_key, sample_key, gumbel_key = jax.random.split(u_key, 3)
             batch = replay_buffer.sample(buffer_state, sample_key).experience
-            a_state, c_state, critic_loss, actor_loss = update(
+            args = (
                 a_state, c_state,
                 batch["obs"].astype(jnp.float32),
                 batch["action"],
@@ -480,6 +552,10 @@ def single_run(config: dict):
                 batch["reward"],
                 batch["done"].astype(jnp.float32),
             )
+            if variant == "gumbel_st":
+                a_state, c_state, critic_loss, actor_loss = update_gumbel_st(*args, gumbel_key, tau_now)
+            else:
+                a_state, c_state, critic_loss, actor_loss = update(*args)
             return (a_state, c_state, u_key), (critic_loss, actor_loss)
 
         should_train = (global_step % config.get("TRAIN_FREQUENCY", 4)) < num_envs

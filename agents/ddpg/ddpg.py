@@ -432,10 +432,21 @@ def single_run(config: dict):
     def step_once(carry, _):
         actor_state, critic_state, buffer_state, env_state, obs, rng, global_step, ep_stats = carry
 
-        # Gumbel-softmax exploration: sample from categorical(logits / tau)
-        rng, action_rng = jax.random.split(rng)
+        # Gumbel-softmax exploration (categorical(logits / tau)) PLUS an
+        # epsilon-greedy floor: pure policy-entropy exploration dies as the
+        # softmax saturates (observed: flat -21, policy locked before the
+        # critic learned anything). The epsilon schedule guarantees coverage.
+        rng, action_rng, eps_rng, rand_rng = jax.random.split(rng, 4)
+        epsilon = jnp.interp(
+            global_step,
+            jnp.array([0, config.get("EXPLORATION_FRACTION", 0.10) * config.get("TOTAL_TIMESTEPS", 10000000)]),
+            jnp.array([config.get("START_E", 1.0), config.get("END_E", 0.01)]),
+        )
         logits = actor.apply(actor_state.params, obs)
-        actions = jax.random.categorical(action_rng, logits / gumbel_tau, axis=-1)
+        gumbel_actions = jax.random.categorical(action_rng, logits / gumbel_tau, axis=-1)
+        random_actions = jax.random.randint(rand_rng, (num_envs,), 0, action_dim)
+        explore_mask = jax.random.uniform(eps_rng, (num_envs,)) < epsilon
+        actions = jnp.where(explore_mask, random_actions, gumbel_actions)
 
         next_obs, next_env_state, rewards, next_done, infos = vmap_step(env_state, actions)
 
@@ -483,7 +494,7 @@ def single_run(config: dict):
 
         global_step += num_envs
         new_carry = (actor_state, critic_state, buffer_state, next_env_state, next_obs, rng, global_step, ep_stats)
-        return new_carry, (jnp.mean(critic_losses), jnp.mean(actor_losses))
+        return new_carry, (jnp.mean(critic_losses), jnp.mean(actor_losses), epsilon)
 
     def save_and_eval(step_count, actor_state):
         if config.get("SAVE_PATH", "./models") is not None:
@@ -547,7 +558,7 @@ def single_run(config: dict):
 
     def outer_step(carry, i):
         base_carry, last_eval = carry
-        base_carry, (critic_losses, actor_losses) = jax.lax.scan(step_once, base_carry, None, length=CHUNK_SIZE)
+        base_carry, (critic_losses, actor_losses, epsilons) = jax.lax.scan(step_once, base_carry, None, length=CHUNK_SIZE)
         actor_state, critic_state, buffer_state, env_state, obs, rng, global_step, ep_stats = base_carry
 
         if eval_during_train:
@@ -566,6 +577,7 @@ def single_run(config: dict):
             "charts/global_step": global_step,
             "charts/avg_episodic_return": ep_stats.returned_episode_returns.mean(),
             "charts/avg_episodic_length": ep_stats.returned_episode_lengths.mean().astype(jnp.float32),
+            "charts/epsilon": epsilons[-1],
             "losses/critic_loss": avg_critic_loss,
             "losses/actor_loss": avg_actor_loss,
         }

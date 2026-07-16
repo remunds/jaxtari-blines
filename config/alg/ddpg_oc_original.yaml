@@ -17,6 +17,9 @@ TRAIN_FREQUENCY: 4
 GAMMA: 0.99
 TAU: 0.005          # polyak coefficient for soft target updates
 GUMBEL_TAU: 1.0     # temperature for categorical exploration sampling
+START_E: 1.0        # epsilon-greedy floor: v1 (gumbel-only) locked into a
+END_E: 0.01         # deterministic bad policy and stayed at -21 for 10M steps
+EXPLORATION_FRACTION: 0.10
 
 EVAL_EVERY: 10
 SAVE_PATH: ./models

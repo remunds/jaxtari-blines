@@ -20,8 +20,12 @@ GAMMA: 0.99
 
 CRITIC_HIDDEN: 1024       # CrossQ: wider critic
 BN_MOMENTUM: 0.99         # CrossQ: BatchNorm momentum
-TARGET_ENTROPY_SCALE: 0.3   # 0.89 (cleanrl) is tuned for 18 actions; too high for small action sets -> alpha explosion
-ALPHA_MAX: 1.0              # safety ceiling for autotuned entropy temperature
+# v1 (scale 0.89, no cap): alpha exploded to 250 at ~3M, killed a +15 policy.
+# v2 (scale 0.3, cap 1.0): learned to +20, then alpha rose to cap at ~3M and killed it.
+# A winning pong policy has natural entropy ~0.5; the target must sit well below
+# that, and alpha's ceiling must be negligible vs the +-1 clipped rewards.
+TARGET_ENTROPY_SCALE: 0.1
+ALPHA_MAX: 0.05
 
 EVAL_EVERY: 10
 SAVE_PATH: ./models

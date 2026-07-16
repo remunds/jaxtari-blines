@@ -358,7 +358,12 @@ def single_run(config: dict):
     )
 
     # entropy temperature (autotuned, discrete target entropy as in cleanrl sac_atari)
-    target_entropy = -config.get("TARGET_ENTROPY_SCALE", 0.89) * jnp.log(1.0 / action_dim)
+    # NOTE: cleanrl's sac_atari uses 0.89 but that is tuned for the full 18-action
+    # Atari space; with small action sets it forces a near-uniform policy and alpha
+    # explodes (observed alpha ~9.4, return stuck at -21 on pong). 0.3 keeps the
+    # entropy target far enough below the ln(|A|) ceiling to allow exploitation.
+    target_entropy = -config.get("TARGET_ENTROPY_SCALE", 0.3) * jnp.log(1.0 / action_dim)
+    log_alpha_max = jnp.log(config.get("ALPHA_MAX", 1.0))  # safety ceiling for autotuned alpha
     # params must be a (frozen)dict for TrainState.apply_gradients, not a bare scalar
     alpha_state = TrainState.create(
         apply_fn=lambda params, _=None: params,  # dummy
@@ -493,8 +498,13 @@ def single_run(config: dict):
 
         alpha_loss, alpha_grads = jax.value_and_grad(alpha_loss_fn)(alpha_state.params)
         alpha_state = alpha_state.apply_gradients(grads=alpha_grads)
+        # clamp alpha to its ceiling so a mis-scaled entropy target cannot dominate rewards
+        alpha_state = alpha_state.replace(
+            params={"log_alpha": jnp.minimum(alpha_state.params["log_alpha"], log_alpha_max)}
+        )
 
-        return actor_state, critic_state, alpha_state, critic_loss, actor_loss, alpha_loss
+        entropy = -jnp.mean(jnp.sum(probs * logp, axis=-1))
+        return actor_state, critic_state, alpha_state, critic_loss, actor_loss, alpha_loss, entropy
 
     def step_once(carry, _):
         actor_state, critic_state, alpha_state, buffer_state, env_state, obs, rng, global_step, ep_stats = carry
@@ -528,7 +538,7 @@ def single_run(config: dict):
             a_state, c_state, al_state, u_key = update_carry
             u_key, sample_key = jax.random.split(u_key)
             batch = replay_buffer.sample(buffer_state, sample_key).experience
-            a_state, c_state, al_state, critic_loss, actor_loss, alpha_loss = update(
+            a_state, c_state, al_state, critic_loss, actor_loss, alpha_loss, entropy = update(
                 a_state, c_state, al_state,
                 batch["obs"].astype(jnp.float32),
                 batch["action"],
@@ -536,21 +546,21 @@ def single_run(config: dict):
                 batch["reward"],
                 batch["done"].astype(jnp.float32),
             )
-            return (a_state, c_state, al_state, u_key), (critic_loss, actor_loss, alpha_loss)
+            return (a_state, c_state, al_state, u_key), (critic_loss, actor_loss, alpha_loss, entropy)
 
         should_train = (global_step % config.get("TRAIN_FREQUENCY", 4)) < num_envs
         can_train = jnp.logical_and(replay_buffer.can_sample(buffer_state), should_train)
 
-        (actor_state, critic_state, alpha_state, rng), (critic_losses, actor_losses, alpha_losses) = jax.lax.cond(
+        (actor_state, critic_state, alpha_state, rng), (critic_losses, actor_losses, alpha_losses, entropies) = jax.lax.cond(
             can_train,
             lambda c: jax.lax.scan(do_update, c, None, length=updates_per_step),
-            lambda c: (c, (jnp.zeros(updates_per_step), jnp.zeros(updates_per_step), jnp.zeros(updates_per_step))),
+            lambda c: (c, (jnp.zeros(updates_per_step), jnp.zeros(updates_per_step), jnp.zeros(updates_per_step), jnp.zeros(updates_per_step))),
             (actor_state, critic_state, alpha_state, rng),
         )
 
         global_step += num_envs
         new_carry = (actor_state, critic_state, alpha_state, buffer_state, next_env_state, next_obs, rng, global_step, ep_stats)
-        return new_carry, (jnp.mean(critic_losses), jnp.mean(actor_losses), jnp.mean(alpha_losses))
+        return new_carry, (jnp.mean(critic_losses), jnp.mean(actor_losses), jnp.mean(alpha_losses), jnp.mean(entropies))
 
     def save_and_eval(step_count, actor_state):
         if config.get("SAVE_PATH", "./models") is not None:
@@ -614,7 +624,7 @@ def single_run(config: dict):
 
     def outer_step(carry, i):
         base_carry, last_eval = carry
-        base_carry, (critic_losses, actor_losses, alpha_losses) = jax.lax.scan(
+        base_carry, (critic_losses, actor_losses, alpha_losses, entropies) = jax.lax.scan(
             step_once, base_carry, None, length=CHUNK_SIZE
         )
         actor_state, critic_state, alpha_state, buffer_state, env_state, obs, rng, global_step, ep_stats = base_carry
@@ -636,6 +646,7 @@ def single_run(config: dict):
             "charts/avg_episodic_return": ep_stats.returned_episode_returns.mean(),
             "charts/avg_episodic_length": ep_stats.returned_episode_lengths.mean().astype(jnp.float32),
             "charts/alpha": jnp.exp(alpha_state.params["log_alpha"]),
+            "charts/policy_entropy": jnp.sum(entropies) / jnp.maximum(jnp.sum(entropies != 0), 1),
             "losses/critic_loss": avg_critic_loss,
             "losses/actor_loss": avg_actor_loss,
         }

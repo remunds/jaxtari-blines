@@ -7,6 +7,7 @@ def main(config):
     merged_config = {**config, **config.get("alg", {})}
     print("Config:\n", OmegaConf.to_yaml(OmegaConf.create(config)))
     n_seeds = merged_config.get("NUM_SEEDS", 1)
+    seed_base = int(merged_config.get("SEED", 0))  # SEED acts as base: seeds run as SEED, SEED+1, ...
 
     all_metrics = []
     for seed in range(n_seeds):
@@ -29,8 +30,8 @@ def main(config):
             from agents.crossq.crossq import single_run
             run_fn = single_run
 
-        print(f"Running seed {seed} ...")
-        merged_config["SEED"] = seed
+        print(f"Running seed {seed_base + seed} ...")
+        merged_config["SEED"] = seed_base + seed
         metrics = run_fn(merged_config)
         metrics["ALG"] = merged_config["ALG"]
         metrics["ENV_ID"] = merged_config["ENV_ID"]

@@ -26,6 +26,8 @@ BN_MOMENTUM: 0.99         # CrossQ: BatchNorm momentum
 # that, and alpha's ceiling must be negligible vs the +-1 clipped rewards.
 TARGET_ENTROPY_SCALE: 0.1
 ALPHA_MAX: 0.05
+POLICY_DELAY: 3           # CrossQ paper/SBX: actor updates every 3rd critic update
+                          # (v3 updated every step -> policy churn, eval oscillated +-20)
 
 EVAL_EVERY: 10
 SAVE_PATH: ./models

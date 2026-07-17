@@ -22,6 +22,7 @@ CRITIC_HIDDEN: 512        # smaller than OC: CNN torso already wide
 BN_MOMENTUM: 0.99
 TARGET_ENTROPY_SCALE: 0.1
 ALPHA_MAX: 0.05
+POLICY_DELAY: 3
 
 EVAL_EVERY: 10
 SAVE_PATH: ./models

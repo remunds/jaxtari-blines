@@ -436,6 +436,7 @@ def single_run(config: dict):
 
     gamma = config.get("GAMMA", 0.99)
     batch_size = config.get("BATCH_SIZE", 64)
+    policy_delay = int(config.get("POLICY_DELAY", 3))
     updates_per_step = max(1, num_envs // config.get("TRAIN_FREQUENCY", 4))
 
     def update(actor_state, critic_state, alpha_state, b_obs, b_act, b_nobs, b_rew, b_don):
@@ -470,40 +471,55 @@ def single_run(config: dict):
         critic_state = critic_state.apply_gradients(grads=critic_grads)
         critic_state = critic_state.replace(batch_stats=new_batch_stats)
 
-        # --- actor update (critic in inference mode, running BN stats) ---
-        q_all = critic.apply(
-            {"params": critic_state.params, "batch_stats": critic_state.batch_stats},
-            b_obs, train=False,
-        )  # (2, B, A)
-        min_q = jax.lax.stop_gradient(jnp.min(q_all, axis=0))  # (B, A)
+        # --- actor + alpha update, gated by POLICY_DELAY (CrossQ paper/SBX use 3):
+        # the actor only moves every N-th critic update so the value function can
+        # settle in between. Updating every step caused persistent policy churn
+        # (eval oscillating between +18 and -20 for the whole of v3).
+        def actor_alpha_update(_):
+            q_all = critic.apply(
+                {"params": critic_state.params, "batch_stats": critic_state.batch_stats},
+                b_obs, train=False,
+            )  # (2, B, A)
+            min_q = jax.lax.stop_gradient(jnp.min(q_all, axis=0))  # (B, A)
 
-        def actor_loss_fn(params):
-            logits = actor.apply(params, b_obs)
-            logp = jax.nn.log_softmax(logits, axis=-1)
-            probs = jnp.exp(logp)
-            loss = jnp.mean(jnp.sum(probs * (alpha * logp - min_q), axis=-1))
-            return loss, (probs, logp)
+            def actor_loss_fn(params):
+                logits = actor.apply(params, b_obs)
+                logp = jax.nn.log_softmax(logits, axis=-1)
+                probs = jnp.exp(logp)
+                loss = jnp.mean(jnp.sum(probs * (alpha * logp - min_q), axis=-1))
+                return loss, (probs, logp)
 
-        (actor_loss, (probs, logp)), actor_grads = jax.value_and_grad(
-            actor_loss_fn, has_aux=True
-        )(actor_state.params)
-        actor_state = actor_state.apply_gradients(grads=actor_grads)
+            (a_loss, (probs, logp)), actor_grads = jax.value_and_grad(
+                actor_loss_fn, has_aux=True
+            )(actor_state.params)
+            new_actor_state = actor_state.apply_gradients(grads=actor_grads)
 
-        # --- alpha (entropy temperature) update ---
-        probs = jax.lax.stop_gradient(probs)
-        logp = jax.lax.stop_gradient(logp)
+            probs = jax.lax.stop_gradient(probs)
+            logp = jax.lax.stop_gradient(logp)
 
-        def alpha_loss_fn(alpha_params):
-            return jnp.mean(jnp.sum(probs * (-jnp.exp(alpha_params["log_alpha"]) * (logp + target_entropy)), axis=-1))
+            def alpha_loss_fn(alpha_params):
+                return jnp.mean(jnp.sum(probs * (-jnp.exp(alpha_params["log_alpha"]) * (logp + target_entropy)), axis=-1))
 
-        alpha_loss, alpha_grads = jax.value_and_grad(alpha_loss_fn)(alpha_state.params)
-        alpha_state = alpha_state.apply_gradients(grads=alpha_grads)
-        # clamp alpha to its ceiling so a mis-scaled entropy target cannot dominate rewards
-        alpha_state = alpha_state.replace(
-            params={"log_alpha": jnp.minimum(alpha_state.params["log_alpha"], log_alpha_max)}
+            al_loss, alpha_grads = jax.value_and_grad(alpha_loss_fn)(alpha_state.params)
+            new_alpha_state = alpha_state.apply_gradients(grads=alpha_grads)
+            # clamp alpha to its ceiling so a mis-scaled entropy target cannot dominate rewards
+            new_alpha_state = new_alpha_state.replace(
+                params={"log_alpha": jnp.minimum(new_alpha_state.params["log_alpha"], log_alpha_max)}
+            )
+
+            ent = -jnp.mean(jnp.sum(probs * logp, axis=-1))
+            return new_actor_state, new_alpha_state, a_loss, al_loss, ent
+
+        def skip_update(_):
+            zero = jnp.asarray(0.0, jnp.float32)
+            return actor_state, alpha_state, zero, zero, zero
+
+        actor_state, alpha_state, actor_loss, alpha_loss, entropy = jax.lax.cond(
+            (critic_state.step % policy_delay) == 0,
+            actor_alpha_update,
+            skip_update,
+            None,
         )
-
-        entropy = -jnp.mean(jnp.sum(probs * logp, axis=-1))
         return actor_state, critic_state, alpha_state, critic_loss, actor_loss, alpha_loss, entropy
 
     def step_once(carry, _):

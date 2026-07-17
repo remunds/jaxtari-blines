@@ -419,6 +419,8 @@ def single_run(config: dict):
     batch_size = config.get("BATCH_SIZE", 32)
     polyak_tau = config.get("TAU", 0.005)
     gumbel_tau = config.get("GUMBEL_TAU", 1.0)
+    policy_delay = int(config.get("POLICY_DELAY", 2))  # TD3-style delayed policy/target updates
+    anneal_frac = float(config.get("GUMBEL_ANNEAL_FRACTION", 0.3))  # tau reaches end value at this fraction of training
     updates_per_step = max(1, num_envs // config.get("TRAIN_FREQUENCY", 4))
 
     def update(actor_state, critic_state, b_obs, b_act, b_nobs, b_rew, b_don):
@@ -471,26 +473,38 @@ def single_run(config: dict):
         critic_loss, critic_grads = jax.value_and_grad(critic_loss_fn)(critic_state.params)
         critic_state = critic_state.apply_gradients(grads=critic_grads)
 
-        # --- actor update: straight-through Gumbel-softmax through the critic ---
-        u = jax.random.uniform(gumbel_key, (batch_size, action_dim), minval=1e-6, maxval=1.0 - 1e-6)
-        g = -jnp.log(-jnp.log(u))
+        # --- actor + target updates, gated by POLICY_DELAY (TD3-style):
+        # the actor and the target networks move only every N-th critic update,
+        # letting the critic settle in between (reduces the eval dips seen in v3).
+        def delayed_updates(_):
+            u = jax.random.uniform(gumbel_key, (batch_size, action_dim), minval=1e-6, maxval=1.0 - 1e-6)
+            g = -jnp.log(-jnp.log(u))
 
-        def actor_loss_fn(params):
-            logits = actor.apply(params, b_obs)
-            y_soft = jax.nn.softmax((logits + g) / tau_now, axis=-1)
-            y_hard = jax.nn.one_hot(jnp.argmax(y_soft, axis=-1), action_dim)
-            y_st = y_hard + y_soft - jax.lax.stop_gradient(y_soft)  # forward hard, backward soft
-            return -jnp.mean(critic.apply(critic_state.params, b_obs, y_st))
+            def actor_loss_fn(params):
+                logits = actor.apply(params, b_obs)
+                y_soft = jax.nn.softmax((logits + g) / tau_now, axis=-1)
+                y_hard = jax.nn.one_hot(jnp.argmax(y_soft, axis=-1), action_dim)
+                y_st = y_hard + y_soft - jax.lax.stop_gradient(y_soft)  # forward hard, backward soft
+                return -jnp.mean(critic.apply(critic_state.params, b_obs, y_st))
 
-        actor_loss, actor_grads = jax.value_and_grad(actor_loss_fn)(actor_state.params)
-        actor_state = actor_state.apply_gradients(grads=actor_grads)
+            a_loss, actor_grads = jax.value_and_grad(actor_loss_fn)(actor_state.params)
+            new_actor = actor_state.apply_gradients(grads=actor_grads)
+            new_critic = critic_state.replace(
+                target_params=optax.incremental_update(critic_state.params, critic_state.target_params, polyak_tau)
+            )
+            new_actor = new_actor.replace(
+                target_params=optax.incremental_update(new_actor.params, new_actor.target_params, polyak_tau)
+            )
+            return new_actor, new_critic, a_loss
 
-        # --- soft target updates ---
-        critic_state = critic_state.replace(
-            target_params=optax.incremental_update(critic_state.params, critic_state.target_params, polyak_tau)
-        )
-        actor_state = actor_state.replace(
-            target_params=optax.incremental_update(actor_state.params, actor_state.target_params, polyak_tau)
+        def skip_updates(_):
+            return actor_state, critic_state, jnp.asarray(0.0, jnp.float32)
+
+        actor_state, critic_state, actor_loss = jax.lax.cond(
+            (critic_state.step % policy_delay) == 0,
+            delayed_updates,
+            skip_updates,
+            None,
         )
         return actor_state, critic_state, critic_loss, actor_loss
 
@@ -510,9 +524,9 @@ def single_run(config: dict):
         # annealed sampling temperature (gumbel_st); fixed for the legacy variant
         tau_now = jnp.interp(
             global_step.astype(jnp.float32),
-            jnp.array([0.0, float(config.get("TOTAL_TIMESTEPS", 10000000))]),
+            jnp.array([0.0, anneal_frac * float(config.get("TOTAL_TIMESTEPS", 10000000))]),
             jnp.array([tau_start, tau_end]),
-        )
+        )  # holds at tau_end after anneal_frac of training (interp clamps)
         tau_act = tau_now if variant == "gumbel_st" else gumbel_tau
         logits = actor.apply(actor_state.params, obs)
         gumbel_actions = jax.random.categorical(action_rng, logits / tau_act, axis=-1)

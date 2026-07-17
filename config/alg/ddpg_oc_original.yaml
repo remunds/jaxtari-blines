@@ -10,8 +10,10 @@ BUFFER_SIZE: 200000
 LEARNING_STARTS: 10000
 CHUNK_SIZE: 1000
 
-ACTOR_LR: 0.0003
+ACTOR_LR: 0.0001    # slower actor rides a more settled critic (v3 showed eval dips from churn)
 CRITIC_LR: 0.0003
+POLICY_DELAY: 2     # TD3-style: actor + targets update every 2nd critic update
+GUMBEL_ANNEAL_FRACTION: 0.3   # tau hits its end value at 30% of training, then holds
 BATCH_SIZE: 32
 TRAIN_FREQUENCY: 4
 GAMMA: 0.99

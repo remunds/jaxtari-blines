@@ -1,5 +1,5 @@
 ALG: DDPG
-EXP_NAME: ddpg
+EXP_NAME: ddpg_tuned
 
 PIXEL_BASED: False
 NATIVE_DOWNSCALING: True
@@ -10,12 +10,12 @@ BUFFER_SIZE: 200000
 LEARNING_STARTS: 10000
 CHUNK_SIZE: 1000
 
-# ORIGINAL = faithful first adaptation (v3): symmetric LRs, no policy delay,
-# temperature annealed over the full run. See ddpg_*_tuned.yaml for the stability pass.
-ACTOR_LR: 0.0003
+# TUNED = tier-1 stability pass (v4): actor LR split, TD3-style delay, fast anneal.
+
+ACTOR_LR: 0.0001
 CRITIC_LR: 0.0003
-POLICY_DELAY: 1
-GUMBEL_ANNEAL_FRACTION: 1.0
+POLICY_DELAY: 2
+GUMBEL_ANNEAL_FRACTION: 0.3
 BATCH_SIZE: 32
 TRAIN_FREQUENCY: 4
 GAMMA: 0.99

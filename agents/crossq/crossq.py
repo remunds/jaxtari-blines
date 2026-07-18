@@ -578,23 +578,23 @@ def single_run(config: dict):
         new_carry = (actor_state, critic_state, alpha_state, buffer_state, next_env_state, next_obs, rng, global_step, ep_stats)
         return new_carry, (jnp.mean(critic_losses), jnp.mean(actor_losses), jnp.mean(alpha_losses), jnp.mean(entropies))
 
-    def save_and_eval(step_count, actor_state):
+    def save_and_eval(step_count, params, suffix=""):
         if config.get("SAVE_PATH", "./models") is not None:
-            model_path = f'{config.get("SAVE_PATH", "./models")}/{run_name}/{config["EXP_NAME"]}_{step_count}_{int(time.time())}.cleanrl_model'
+            model_path = f'{config.get("SAVE_PATH", "./models")}/{run_name}/{config["EXP_NAME"]}{suffix}_{step_count}_{int(time.time())}.cleanrl_model'
             os.makedirs(os.path.dirname(model_path), exist_ok=True)
             with open(model_path, "wb") as f:
-                f.write(flax.serialization.to_bytes((None, actor_state.params)))
+                f.write(flax.serialization.to_bytes((None, params)))
             print(f"model saved to {model_path}")
 
         metrics = {}
         for mods_cfg, mod_label in eval_configs:
             episodic_returns, first_states_history, first_done = eval_fns[mod_label](
-                actor_state.params, eval_reset_keys, 0.05
+                params, eval_reset_keys, 0.05
             )
             avg_eval_return = float(jnp.mean(episodic_returns))
-            return_key = f"eval/episodic_return_{mod_label}"
+            return_key = f"eval/episodic_return_{mod_label}{suffix}"
             metrics[return_key] = avg_eval_return
-            print(f"final eval ({mod_label}): average return = {avg_eval_return}")
+            print(f"final eval ({mod_label}{suffix}): average return = {avg_eval_return}")
             wandb.log({return_key: avg_eval_return}, step=step_count)
 
             if config.get("CAPTURE_VIDEO", False):
@@ -606,8 +606,8 @@ def single_run(config: dict):
                 frames = jax.vmap(clean_renderer.render)(env_states_until_done)
                 frames = jnp.transpose(frames, (0, 3, 1, 2))
                 video = wandb.Video(np.array(frames), fps=30, format="mp4")
-                wandb.log({f"eval/video_{mod_label}": video}, step=step_count)
-                print(f"video (eval) logged with {frames.shape} frames ({mod_label}).")
+                wandb.log({f"eval/video_{mod_label}{suffix}": video}, step=step_count)
+                print(f"video (eval) logged with {frames.shape} frames ({mod_label}{suffix}).")
         return metrics
 
     if config.get("NUM_STEPS"):
@@ -639,7 +639,7 @@ def single_run(config: dict):
         wandb.log(d, step=step)
 
     def outer_step(carry, i):
-        base_carry, last_eval = carry
+        base_carry, last_eval, best_eval, best_params = carry
         base_carry, (critic_losses, actor_losses, alpha_losses, entropies) = jax.lax.scan(
             step_once, base_carry, None, length=CHUNK_SIZE
         )
@@ -651,6 +651,15 @@ def single_run(config: dict):
                 lambda p: inscan_eval_fn(p, eval_reset_keys, 0.05),
                 lambda p: last_eval,
                 actor_state.params,
+            )
+            # best-checkpoint tracking: keep a copy of the actor params whenever the
+            # in-scan eval improves. Motivated by the observed late-training collapses
+            # (v2/v4/v5 died at 3-7M after playing at +20): the final snapshot can be a
+            # corpse while the run's true capability lives mid-training.
+            improved = eval_return > best_eval
+            best_eval = jnp.where(improved, eval_return, best_eval)
+            best_params = jax.tree.map(
+                lambda b, c: jnp.where(improved, c, b), best_params, actor_state.params
             )
         else:
             eval_return = last_eval
@@ -668,9 +677,10 @@ def single_run(config: dict):
         }
         if eval_during_train:
             metrics[f"eval/episodic_return_{train_label}"] = eval_return
+            metrics["eval/best_return_so_far"] = best_eval
         jax.debug.callback(log_cb, metrics)
 
-        return (base_carry, eval_return), None
+        return (base_carry, eval_return, best_eval, best_params), None
 
     key, reset_key = jax.random.split(key)
     obs, env_state = vmap_reset(jax.random.split(reset_key, num_envs))
@@ -682,19 +692,26 @@ def single_run(config: dict):
         if eval_during_train:
             init_eval = inscan_eval_fn(base_carry[0].params, eval_reset_keys, 0.05)
         else:
-            init_eval = jnp.float32(0.0)
-        carry, _ = _tqdx.scan(outer_step, (base_carry, init_eval), jnp.arange(1, total_iterations + 1))
+            init_eval = jnp.float32(-jnp.inf)
+        best_params_init = jax.tree.map(jnp.copy, base_carry[0].params)
+        carry, _ = _tqdx.scan(
+            outer_step, (base_carry, init_eval, init_eval, best_params_init), jnp.arange(1, total_iterations + 1)
+        )
         return carry
 
     print(f"[crossq_scan] compiling one scan of {total_iterations} chunks x {CHUNK_SIZE * num_envs} steps...")
     start_time = time.time()
-    (base_carry, _last_eval) = jax.block_until_ready(train(base_carry))
+    (base_carry, _last_eval, best_eval, best_actor_params) = jax.block_until_ready(train(base_carry))
     wall = time.time() - start_time
 
     actor_state = base_carry[0]
     total_steps = int(base_carry[7])
     print(f"[crossq_scan] {total_steps} steps in {wall:.1f}s incl. compile -> {int(total_steps / wall)} SPS (compile-inclusive)")
 
-    eval_metrics = save_and_eval(total_steps, actor_state)
+    eval_metrics = save_and_eval(total_steps, actor_state.params)
+    if eval_during_train:
+        print(f"best in-scan eval during training: {float(best_eval):.2f}")
+        best_metrics = save_and_eval(total_steps, best_actor_params, suffix="_best")
+        eval_metrics.update(best_metrics)
     wandb.finish()
     return eval_metrics

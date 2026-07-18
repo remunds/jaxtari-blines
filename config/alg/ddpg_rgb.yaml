@@ -1,5 +1,5 @@
 ALG: DDPG
-EXP_NAME: ddpg_tuned
+EXP_NAME: ddpg
 
 PIXEL_BASED: True
 NATIVE_DOWNSCALING: True

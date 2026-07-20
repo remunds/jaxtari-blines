@@ -297,7 +297,7 @@ def single_run(config: dict):
         )
 
         def do_update(update_carry, _):
-            u_state, u_buffer_state, u_key = update_carry
+            u_state, u_key = update_carry
             u_key, sample_key = jax.random.split(u_key)
 
             batch = replay_buffer.sample(buffer_state, sample_key).experience

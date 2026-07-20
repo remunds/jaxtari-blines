@@ -1,24 +1,3 @@
-# Discrete adaptation of CrossQ for JAXAtari.
-#
-# References:
-#   CrossQ (continuous, SBX): https://github.com/araffin/sbx  /  Bhatt et al. 2024,
-#   "CrossQ: Batch Normalization in Deep Reinforcement Learning..."
-#   Discrete SAC backbone: https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/sac_atari.py
-#   (Christodoulou 2019 for the discrete-SAC losses)
-#
-# There is no discrete/Atari CrossQ reference implementation, so this is an
-# ADAPTATION, not a port. It is discrete SAC plus CrossQ's three changes:
-#   1. NO target networks. The critic target is computed from the live critic
-#      via CrossQ's joint-batch trick: (s, s') are concatenated into one batch
-#      for a single forward pass so BatchNorm normalizes both under the same
-#      statistics; the s' half is stop-gradient'ed.
-#   2. BatchNorm (momentum 0.99) in the critic torso.
-#   3. Wider critic + Adam beta1 = 0.5.
-# Discrete-SAC parts kept: twin critics (min), categorical policy, entropy
-# temperature alpha with autotuning against a discrete target entropy.
-#
-# Training loop, logging, eval and mods handling follow the repo-wide
-# outer-scan pattern (see agents/c51/c51.py).
 import os
 import random
 import time
@@ -127,7 +106,7 @@ class Actor(nn.Module):
             x = nn.Dense(self.hidden_size)(x)
             x = nn.LayerNorm()(x)
             x = nn.relu(x)
-        return nn.Dense(self.action_dim)(x)  # logits
+        return nn.Dense(self.action_dim)(x)
 
 
 class SingleCritic(nn.Module):
@@ -261,7 +240,7 @@ def build_eval_return_fn(env, actor_apply, action_dim, max_steps):
         obs, state, keys, params, epsilon = carry
         actions, keys = jax.vmap(get_action, in_axes=(None, 0, 0, None))(params, obs, keys, epsilon)
         obs, state, reward, done = jax.vmap(wrapped_step)(state, actions)
-        return (obs, state, keys, params, epsilon), (done, reward)  # no state history
+        return (obs, state, keys, params, epsilon), (done, reward)
 
     def eval_return_fn(params, reset_keys, epsilon):
         obs, state = jax.vmap(wrapped_reset)(reset_keys)
@@ -301,7 +280,6 @@ def single_run(config: dict):
         save_code=True,
     )
 
-    # do not modify the seeding
     random.seed(config["SEED"])
     np.random.seed(config["SEED"])
     key = jax.random.PRNGKey(config["SEED"])
@@ -344,7 +322,7 @@ def single_run(config: dict):
     actor_params = actor.init(actor_key, dummy_obs)
     critic_variables = critic.init(critic_key, dummy_obs, train=False)
 
-    adam_b1 = config.get("ADAM_B1", 0.5)  # CrossQ uses beta1=0.5
+    adam_b1 = config.get("ADAM_B1", 0.5)
     actor_state = TrainState.create(
         apply_fn=actor.apply,
         params=actor_params,
@@ -357,16 +335,10 @@ def single_run(config: dict):
         tx=optax.adam(learning_rate=config.get("CRITIC_LR", 3e-4), b1=adam_b1),
     )
 
-    # entropy temperature (autotuned, discrete target entropy as in cleanrl sac_atari)
-    # NOTE: cleanrl's sac_atari uses 0.89 but that is tuned for the full 18-action
-    # Atari space; with small action sets it forces a near-uniform policy and alpha
-    # explodes (observed alpha ~9.4, return stuck at -21 on pong). 0.3 keeps the
-    # entropy target far enough below the ln(|A|) ceiling to allow exploitation.
     target_entropy = -config.get("TARGET_ENTROPY_SCALE", 0.3) * jnp.log(1.0 / action_dim)
-    log_alpha_max = jnp.log(config.get("ALPHA_MAX", 1.0))  # safety ceiling for autotuned alpha
-    # params must be a (frozen)dict for TrainState.apply_gradients, not a bare scalar
+    log_alpha_max = jnp.log(config.get("ALPHA_MAX", 1.0))
     alpha_state = TrainState.create(
-        apply_fn=lambda params, _=None: params,  # dummy
+        apply_fn=lambda params, _=None: params,
         params={"log_alpha": jnp.zeros(())},
         tx=optax.adam(learning_rate=config.get("ALPHA_LR", 3e-4), b1=adam_b1),
     )
@@ -421,7 +393,6 @@ def single_run(config: dict):
             action_dim=action_dim,
         )
 
-    # in-scan eval runs on the training env config (default game if TRAIN_MODS empty)
     train_label = "default" if not train_mods else "_".join(str(m) for m in train_mods)
     inscan_eval_env = make_env(
         config["ENV_ID"],
@@ -442,26 +413,24 @@ def single_run(config: dict):
     def update(actor_state, critic_state, alpha_state, b_obs, b_act, b_nobs, b_rew, b_don):
         alpha = jnp.exp(alpha_state.params["log_alpha"])
 
-        # policy distribution at s' (for the soft target)
         next_logits = actor.apply(actor_state.params, b_nobs)
         next_logp = jax.nn.log_softmax(next_logits, axis=-1)
         next_probs = jnp.exp(next_logp)
 
-        # --- critic update with CrossQ joint-batch trick (NO target networks) ---
         def critic_loss_fn(params, batch_stats):
             joint = jnp.concatenate([b_obs, b_nobs], axis=0)
             q_joint, mutated = critic.apply(
                 {"params": params, "batch_stats": batch_stats},
                 joint, train=True, mutable=["batch_stats"],
-            )  # (2, 2B, A)
-            q_s, q_ns = jnp.split(q_joint, 2, axis=1)  # each (2, B, A)
+            )
+            q_s, q_ns = jnp.split(q_joint, 2, axis=1)
             q_ns = jax.lax.stop_gradient(q_ns)
 
-            min_q_ns = jnp.min(q_ns, axis=0)  # (B, A)
-            soft_v = jnp.sum(next_probs * (min_q_ns - alpha * next_logp), axis=-1)  # (B,)
+            min_q_ns = jnp.min(q_ns, axis=0)
+            soft_v = jnp.sum(next_probs * (min_q_ns - alpha * next_logp), axis=-1)
             y = jax.lax.stop_gradient(b_rew + gamma * (1.0 - b_don) * soft_v)
 
-            q_pred = q_s[:, jnp.arange(batch_size), b_act]  # (2, B)
+            q_pred = q_s[:, jnp.arange(batch_size), b_act]
             loss = jnp.mean((q_pred - y[None, :]) ** 2)
             return loss, mutated["batch_stats"]
 
@@ -471,16 +440,12 @@ def single_run(config: dict):
         critic_state = critic_state.apply_gradients(grads=critic_grads)
         critic_state = critic_state.replace(batch_stats=new_batch_stats)
 
-        # --- actor + alpha update, gated by POLICY_DELAY (CrossQ paper/SBX use 3):
-        # the actor only moves every N-th critic update so the value function can
-        # settle in between. Updating every step caused persistent policy churn
-        # (eval oscillating between +18 and -20 for the whole of v3).
         def actor_alpha_update(_):
             q_all = critic.apply(
                 {"params": critic_state.params, "batch_stats": critic_state.batch_stats},
                 b_obs, train=False,
-            )  # (2, B, A)
-            min_q = jax.lax.stop_gradient(jnp.min(q_all, axis=0))  # (B, A)
+            )
+            min_q = jax.lax.stop_gradient(jnp.min(q_all, axis=0))
 
             def actor_loss_fn(params):
                 logits = actor.apply(params, b_obs)
@@ -502,7 +467,6 @@ def single_run(config: dict):
 
             al_loss, alpha_grads = jax.value_and_grad(alpha_loss_fn)(alpha_state.params)
             new_alpha_state = alpha_state.apply_gradients(grads=alpha_grads)
-            # clamp alpha to its ceiling so a mis-scaled entropy target cannot dominate rewards
             new_alpha_state = new_alpha_state.replace(
                 params={"log_alpha": jnp.minimum(new_alpha_state.params["log_alpha"], log_alpha_max)}
             )
@@ -525,7 +489,6 @@ def single_run(config: dict):
     def step_once(carry, _):
         actor_state, critic_state, alpha_state, buffer_state, env_state, obs, rng, global_step, ep_stats = carry
 
-        # sample actions from the categorical policy
         rng, action_rng = jax.random.split(rng)
         logits = actor.apply(actor_state.params, obs)
         actions = jax.random.categorical(action_rng, logits, axis=-1)
@@ -652,10 +615,6 @@ def single_run(config: dict):
                 lambda p: last_eval,
                 actor_state.params,
             )
-            # best-checkpoint tracking: keep a copy of the actor params whenever the
-            # in-scan eval improves. Motivated by the observed late-training collapses
-            # (v2/v4/v5 died at 3-7M after playing at +20): the final snapshot can be a
-            # corpse while the run's true capability lives mid-training.
             improved = eval_return > best_eval
             best_eval = jnp.where(improved, eval_return, best_eval)
             best_params = jax.tree.map(

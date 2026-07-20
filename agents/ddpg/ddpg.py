@@ -1,24 +1,3 @@
-# Discrete adaptation of DDPG for JAXAtari.
-#
-# Reference for the continuous original:
-# https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ddpg_continuous_action_jax.py
-#
-# There is no discrete/Atari DDPG reference implementation, so this is an
-# ADAPTATION, not a port. Design choices (documented for review):
-#   - Actor outputs logits over the discrete action set. Acting samples via
-#     Gumbel-softmax / categorical with temperature GUMBEL_TAU (deterministic
-#     argmax at evaluation).
-#   - Critic is DQN-style: Q(s, .) for all actions in one forward pass.
-#   - Actor loss is the exact expected Q under the policy:
-#     L_actor = -E_s[ sum_a pi(a|s) Q(s,a) ]  (lower-variance analytic form of
-#     the Gumbel-softmax relaxation; gradients flow through pi).
-#   - Critic target uses the target actor's argmax action and the target
-#     critic: y = r + gamma * (1-d) * Q_target(s', argmax target_actor(s')).
-#   - Soft target updates (polyak TAU) for both actor and critic.
-#
-# Training loop, logging, eval and mods handling follow the repo-wide
-# outer-scan pattern (see agents/dqn_progress/dqn.py on rafet's fork and
-# agents/c51/c51.py here).
 import os
 import random
 import time
@@ -249,7 +228,7 @@ def build_eval_return_fn(env, actor_apply, action_dim, max_steps):
         obs, state, keys, params, epsilon = carry
         actions, keys = jax.vmap(get_action, in_axes=(None, 0, 0, None))(params, obs, keys, epsilon)
         obs, state, reward, done = jax.vmap(wrapped_step)(state, actions)
-        return (obs, state, keys, params, epsilon), (done, reward)  # no state history
+        return (obs, state, keys, params, epsilon), (done, reward)
 
     def eval_return_fn(params, reset_keys, epsilon):
         obs, state = jax.vmap(wrapped_reset)(reset_keys)
@@ -289,7 +268,6 @@ def single_run(config: dict):
         save_code=True,
     )
 
-    # do not modify the seeding
     random.seed(config["SEED"])
     np.random.seed(config["SEED"])
     key = jax.random.PRNGKey(config["SEED"])
@@ -319,10 +297,6 @@ def single_run(config: dict):
         next_done = jnp.logical_or(terminated, truncated)
         return next_obs.reshape(action.shape[0], *obs_shape), state, reward, next_done, info
 
-    # "gumbel_st": Q(s,a)-critic + straight-through Gumbel-softmax actor gradient
-    #              with annealed temperature (MADDPG-style, the faithful adaptation).
-    # "expected_q": original variant — Q(s,.)-critic, actor maximizes E_pi[Q].
-    #              Kept for the ablation record; it failed to learn on pong.
     variant = str(config.get("VARIANT", "gumbel_st")).lower()
     tau_start = float(config.get("GUMBEL_TAU_START", 2.0))
     tau_end = float(config.get("GUMBEL_TAU_END", 0.5))
@@ -402,7 +376,6 @@ def single_run(config: dict):
             action_dim=action_dim,
         )
 
-    # in-scan eval runs on the training env config (default game if TRAIN_MODS empty)
     train_label = "default" if not train_mods else "_".join(str(m) for m in train_mods)
     inscan_eval_env = make_env(
         config["ENV_ID"],
@@ -419,14 +392,13 @@ def single_run(config: dict):
     batch_size = config.get("BATCH_SIZE", 32)
     polyak_tau = config.get("TAU", 0.005)
     gumbel_tau = config.get("GUMBEL_TAU", 1.0)
-    policy_delay = int(config.get("POLICY_DELAY", 2))  # TD3-style delayed policy/target updates
-    anneal_frac = float(config.get("GUMBEL_ANNEAL_FRACTION", 0.3))  # tau reaches end value at this fraction of training
+    policy_delay = int(config.get("POLICY_DELAY", 2))
+    anneal_frac = float(config.get("GUMBEL_ANNEAL_FRACTION", 0.3))
     updates_per_step = max(1, num_envs // config.get("TRAIN_FREQUENCY", 4))
 
     def update(actor_state, critic_state, b_obs, b_act, b_nobs, b_rew, b_don):
-        # --- critic update ---
         next_logits = actor.apply(actor_state.target_params, b_nobs)
-        next_actions = jnp.argmax(next_logits, axis=-1)  # deterministic target policy
+        next_actions = jnp.argmax(next_logits, axis=-1)
         next_q_all = critic.apply(critic_state.target_params, b_nobs)
         next_q = next_q_all[jnp.arange(batch_size), next_actions]
         y = b_rew + gamma * (1.0 - b_don) * next_q
@@ -440,7 +412,6 @@ def single_run(config: dict):
         critic_loss, critic_grads = jax.value_and_grad(critic_loss_fn)(critic_state.params)
         critic_state = critic_state.apply_gradients(grads=critic_grads)
 
-        # --- actor update: maximize expected Q under the policy ---
         def actor_loss_fn(params):
             logits = actor.apply(params, b_obs)
             probs = jax.nn.softmax(logits, axis=-1)
@@ -450,7 +421,6 @@ def single_run(config: dict):
         actor_loss, actor_grads = jax.value_and_grad(actor_loss_fn)(actor_state.params)
         actor_state = actor_state.apply_gradients(grads=actor_grads)
 
-        # --- soft target updates ---
         critic_state = critic_state.replace(
             target_params=optax.incremental_update(critic_state.params, critic_state.target_params, polyak_tau)
         )
@@ -460,7 +430,6 @@ def single_run(config: dict):
         return actor_state, critic_state, critic_loss, actor_loss
 
     def update_gumbel_st(actor_state, critic_state, b_obs, b_act, b_nobs, b_rew, b_don, gumbel_key, tau_now):
-        # --- critic update: Q(s, onehot(a)) with deterministic target policy ---
         next_logits = actor.apply(actor_state.target_params, b_nobs)
         next_onehot = jax.nn.one_hot(jnp.argmax(next_logits, axis=-1), action_dim)
         next_q = critic.apply(critic_state.target_params, b_nobs, next_onehot)
@@ -473,9 +442,6 @@ def single_run(config: dict):
         critic_loss, critic_grads = jax.value_and_grad(critic_loss_fn)(critic_state.params)
         critic_state = critic_state.apply_gradients(grads=critic_grads)
 
-        # --- actor + target updates, gated by POLICY_DELAY (TD3-style):
-        # the actor and the target networks move only every N-th critic update,
-        # letting the critic settle in between (reduces the eval dips seen in v3).
         def delayed_updates(_):
             u = jax.random.uniform(gumbel_key, (batch_size, action_dim), minval=1e-6, maxval=1.0 - 1e-6)
             g = -jnp.log(-jnp.log(u))
@@ -484,7 +450,7 @@ def single_run(config: dict):
                 logits = actor.apply(params, b_obs)
                 y_soft = jax.nn.softmax((logits + g) / tau_now, axis=-1)
                 y_hard = jax.nn.one_hot(jnp.argmax(y_soft, axis=-1), action_dim)
-                y_st = y_hard + y_soft - jax.lax.stop_gradient(y_soft)  # forward hard, backward soft
+                y_st = y_hard + y_soft - jax.lax.stop_gradient(y_soft)
                 return -jnp.mean(critic.apply(critic_state.params, b_obs, y_st))
 
             a_loss, actor_grads = jax.value_and_grad(actor_loss_fn)(actor_state.params)
@@ -511,22 +477,17 @@ def single_run(config: dict):
     def step_once(carry, _):
         actor_state, critic_state, buffer_state, env_state, obs, rng, global_step, ep_stats = carry
 
-        # Gumbel-softmax exploration (categorical(logits / tau)) PLUS an
-        # epsilon-greedy floor: pure policy-entropy exploration dies as the
-        # softmax saturates (observed: flat -21, policy locked before the
-        # critic learned anything). The epsilon schedule guarantees coverage.
         rng, action_rng, eps_rng, rand_rng = jax.random.split(rng, 4)
         epsilon = jnp.interp(
             global_step,
             jnp.array([0, config.get("EXPLORATION_FRACTION", 0.10) * config.get("TOTAL_TIMESTEPS", 10000000)]),
             jnp.array([config.get("START_E", 1.0), config.get("END_E", 0.01)]),
         )
-        # annealed sampling temperature (gumbel_st); fixed for the legacy variant
         tau_now = jnp.interp(
             global_step.astype(jnp.float32),
             jnp.array([0.0, anneal_frac * float(config.get("TOTAL_TIMESTEPS", 10000000))]),
             jnp.array([tau_start, tau_end]),
-        )  # holds at tau_end after anneal_frac of training (interp clamps)
+        )
         tau_act = tau_now if variant == "gumbel_st" else gumbel_tau
         logits = actor.apply(actor_state.params, obs)
         gumbel_actions = jax.random.categorical(action_rng, logits / tau_act, axis=-1)
@@ -658,7 +619,6 @@ def single_run(config: dict):
                 lambda p: last_eval,
                 actor_state.params,
             )
-            # best-checkpoint tracking: keep the actor params from the best in-scan eval
             improved = eval_return > best_eval
             best_eval = jnp.where(improved, eval_return, best_eval)
             best_params = jax.tree.map(

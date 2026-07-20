@@ -27,4 +27,3 @@ POLICY_DELAY: 3
 EVAL_EVERY: 10
 SAVE_PATH: ./models
 
-RUN_NAME: v1_crossq_rgb_original

@@ -32,4 +32,3 @@ POLICY_DELAY: 3           # CrossQ paper/SBX: actor updates every 3rd critic upd
 EVAL_EVERY: 10
 SAVE_PATH: ./models
 
-RUN_NAME: v1_crossq_oc_original

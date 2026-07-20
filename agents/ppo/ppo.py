@@ -22,22 +22,14 @@ from agents.ppo.ppo_eval import evaluate
 from rtpt import RTPT
 
 def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False):
+    assert mods is None or isinstance(mods, list), "mods must be None or a list of strings"
+    if mods is not None and len(mods) == 0:
+        mods = None
+    if not eval and mods is not None and len(mods) > 0:
+        print(f"[WARNING] Training on mods {mods}!")
+
     def thunk():
-        # For training (eval=False), avoid applying multiple potentially conflicting
-        # mods at once. In that case, fall back to the base environment.
-        # For evaluation (eval=True), we trust the caller to pass either a single
-        # mod or an explicit list; this is used in the per-mod video generation.
-        active_mods = mods
-        if not eval and isinstance(active_mods, (list, tuple)) and len(active_mods) > 1:
-            active_mods = []
-
-        # Normalize to None or list for jaxatari.make
-        if isinstance(active_mods, (list, tuple)) and len(active_mods) == 0:
-            mods_arg = None
-        else:
-            mods_arg = active_mods
-
-        env = jaxatari.make(env_id, mods=mods_arg)
+        env = jaxatari.make(env_id, mods=mods)
         env = AtariWrapper(
                 env,
                 sticky_actions=0.0,
@@ -57,7 +49,7 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
                 frame_stack_size=4,
                 frame_skip=4,
                 max_pooling=True,
-                clip_reward=True, # only active during training
+                clip_reward=not eval,
             )
         else:
             env = FlattenObservationWrapper(
@@ -66,7 +58,7 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
                         env,
                         frame_stack_size=4,
                         frame_skip=4,
-                        clip_reward=True,
+                        clip_reward=not eval,
                     )
                 )
             )
@@ -163,15 +155,6 @@ class Storage:
     returns: jnp.array
     rewards: jnp.array
 
-
-@flax.struct.dataclass
-class EpisodeStatistics:
-    episode_returns: jnp.array
-    episode_lengths: jnp.array
-    returned_episode_returns: jnp.array
-    returned_episode_lengths: jnp.array
-
-
 def single_run(config: dict):
     config = {k.upper(): v for k, v in config.items() if k != "alg"}
 
@@ -220,7 +203,6 @@ def single_run(config: dict):
     vmap_step = wrapped_step
     
     assert isinstance(env.action_space(), spaces.Discrete), "only discrete action space is supported"
-    # assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     def linear_schedule(count):
         # anneal learning rate linearly after one training iteration which contains
@@ -231,8 +213,6 @@ def single_run(config: dict):
     network = Network() if config["PIXEL_BASED"] else MLP_Network()
     actor = Actor(action_dim=env.action_space().n)
     critic = Critic()
-    # network_params = network.init(network_key, env.observation_space().sample(obs_sample_key1).squeeze()[None, ...])
-    # Init shape is (1,4,84,84) (which will be transposed inside the network to (1,84,84,4))
     network_params = network.init(network_key, env.observation_space().sample(obs_sample_key1).squeeze()[None, ...])
     agent_state = TrainState.create(
         apply_fn=None,
@@ -433,7 +413,7 @@ def single_run(config: dict):
                 config["ENV_ID"],
                 eval_episodes=10,
                 Model=(Network, Actor, Critic) if config["PIXEL_BASED"] else (MLP_Network, Actor, Critic),
-                seed=config["SEED"],
+                seed=config["SEED"]+42, # use a different seed for evaluation 
             )
             # wandb.log({f"eval/episodic_return_{mod_label}": np.mean(jax.device_get(episodic_returns)), "step": iteration})
             metrics[mod_label] = np.mean(jax.device_get(episodic_returns))
@@ -488,7 +468,7 @@ def single_run(config: dict):
 
     fn_rollout = partial(rollout, step_once_fn=partial(step_once, env_step_fn=vmap_step), max_steps=config["NUM_STEPS"])
 
-    rtpt = RTPT(name_initials='RE', experiment_name=run_name, max_iterations=config["NUM_ITERATIONS"])
+    rtpt = RTPT(name_initials=config["NAME_INITIALS"], experiment_name=run_name, max_iterations=config["NUM_ITERATIONS"])
     rtpt.start()
     start_time = time.time()
     compile_time = None
@@ -511,7 +491,6 @@ def single_run(config: dict):
         if compile_time is None:
             compile_time = time.time()
             print(f"Compile + first iteration time: {compile_time - start_time:.2f} seconds.")
-        # print(f"global_step={global_step}, avg_episodic_return={avg_episodic_return}")
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         metrics = {
@@ -536,7 +515,9 @@ def single_run(config: dict):
         print(f"Run time after first iteration: {end_time - compile_time:.2f} seconds.")
     print(f"Total train time: {end_time - start_time:.2f} seconds / {(end_time - start_time)/60:.2f} minutes.")
 
+    print("Evaluating final model ...") 
     eval_metrics = save_and_eval(iteration+1)
+    print("Done.") 
 
     # if config["UPLOAD_MODEL"]:
     #     from cleanrl_utils.huggingface import push_to_hub

@@ -36,7 +36,6 @@ def evaluate(
         return next_obs.squeeze()[None, ...], next_state, reward, done, info
 
     key, reset_key = jax.random.split(key)
-    next_obs, handle = wrapped_reset(reset_key)
     network = _Network()
     actor = _Actor(action_dim=env.action_space().n)
     critic = _Critic()
@@ -78,7 +77,7 @@ def evaluate(
     # evaluate eval_episodes concurrently
     reset_keys = jax.random.split(key, eval_episodes)
     next_obs, env_states = jax.vmap(wrapped_reset)(reset_keys)
-    _, (first_states, dones, rewards, actions) = jax.lax.scan(step_fn, (next_obs, env_states, reset_keys), None, length=10_000)
+    _, (first_states, dones, rewards, actions) = jax.lax.scan(step_fn, (next_obs, env_states, reset_keys), None, length=27_000) #27k * 4 (frame skip) = 108k frames, the max number typically used 
 
 
     # obs shape: (time, eval_episodes, 1, H, W)
@@ -91,7 +90,6 @@ def evaluate(
     episodic_returns = jnp.sum(rewards, axis=0)  # shape: (eval_episodes,)
 
     # first episode video capture
-    # states_until_done = first_obs[:first_done[0] + 1, 0]  # shape: (time_until_done, 1, H, W)
     env_states_until_done = jax.tree.map(lambda x: x[:first_done[0] + 1], first_states.atari_state.atari_state.env_state)
 
     return episodic_returns, env_states_until_done

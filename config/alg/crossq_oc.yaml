@@ -1,0 +1,34 @@
+ALG: CROSSQ
+EXP_NAME: crossq
+
+PIXEL_BASED: False
+NATIVE_DOWNSCALING: True
+NUM_ENVS: 32
+
+TOTAL_TIMESTEPS: 10000000
+BUFFER_SIZE: 200000
+LEARNING_STARTS: 10000
+CHUNK_SIZE: 1000
+
+ACTOR_LR: 0.0003
+CRITIC_LR: 0.0002
+ALPHA_LR: 0.0003
+ADAM_B1: 0.5              # CrossQ: Adam beta1 = 0.5
+BATCH_SIZE: 64
+TRAIN_FREQUENCY: 4
+GAMMA: 0.99
+
+CRITIC_HIDDEN: 1024       # CrossQ: wider critic
+BN_MOMENTUM: 0.99         # CrossQ: BatchNorm momentum
+# v1 (scale 0.89, no cap): alpha exploded to 250 at ~3M, killed a +15 policy.
+# v2 (scale 0.3, cap 1.0): learned to +20, then alpha rose to cap at ~3M and killed it.
+# A winning pong policy has natural entropy ~0.5; the target must sit well below
+# that, and alpha's ceiling must be negligible vs the +-1 clipped rewards.
+TARGET_ENTROPY_SCALE: 0.1
+ALPHA_MAX: 0.05
+POLICY_DELAY: 3           # CrossQ paper/SBX: actor updates every 3rd critic update
+                          # (v3 updated every step -> policy churn, eval oscillated +-20)
+
+EVAL_EVERY: 10
+SAVE_PATH: ./models
+

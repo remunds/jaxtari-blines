@@ -44,10 +44,10 @@ ENVS: list[str] = [
 ]
 
 CONFIGS: list[str] = [
-    "dqn_rgb_tuned",
     "dqn_oc_tuned",
-    # "dqn_rgb_original",
+    "dqn_rgb_tuned",
     # "dqn_oc_original",
+    # "dqn_rgb_original",
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════════

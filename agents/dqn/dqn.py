@@ -444,6 +444,7 @@ def single_run(config: dict):
         wandb.log(metrics, step=global_step)
 
     eval_metrics = save_and_eval(global_step+1)
+    wandb.finish()
     return eval_metrics
 
 

@@ -5,7 +5,7 @@ PIXEL_BASED: False
 NATIVE_DOWNSCALING: True
 
 TOTAL_TIMESTEPS: 10000000
-BUFFER_SIZE: 1000000
+BUFFER_SIZE: 100000 # reduced by 0.1x to scale up n_envs (might even work with 1M)
 LEARNING_STARTS: 80000 # scales automatically with n_envs, no need to adapt
 TARGET_NETWORK_FREQUENCY: 1000 # scales automatically
 SCAN_STEPS: 1000

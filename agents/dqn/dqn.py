@@ -188,6 +188,8 @@ def single_run(config: dict):
         obs_shape = obs_shape[:-1]
 
     num_envs = config["NUM_ENVS"]
+    # if -1: we do as many gradient steps as collected samples (stable_baselines3 behavior) 
+    gradient_steps = num_envs * config.get("TRAIN_FREQUENCY", 4) if config.get("GRADIENT_STEPS", 1) == -1 else config.get("GRADIENT_STEPS", 1) 
 
     @jax.jit
     def vmap_reset(rng):
@@ -219,27 +221,10 @@ def single_run(config: dict):
         tx=tx,
     )
 
-    obs_dtype = jnp.uint8 if config.get("PIXEL_BASED", True) else jnp.float32
-    # replay_buffer = fbx.make_item_buffer(
-    #     max_length=config.get("BUFFER_SIZE", 1000000),
-    #     min_length=config.get("LEARNING_STARTS", 80000),
-    #     sample_batch_size=batch_size,
-    #     add_batches=True,
-    # )
-    # example_transition = {
-    #     "obs": jnp.zeros(obs_shape, dtype=obs_dtype),
-    #     "action": jnp.zeros((), dtype=jnp.int32),
-    #     "reward": jnp.zeros((), dtype=jnp.float32),
-    #     "done": jnp.zeros((), dtype=jnp.bool_),
-    #     "next_obs": jnp.zeros(obs_shape, dtype=obs_dtype),
-    # }
-    # buffer_state = replay_buffer.init(example_transition)
-
     replay_buffer = fbx.make_flat_buffer(
         max_length=config.get("BUFFER_SIZE", 1000000),
         min_length=config.get("LEARNING_STARTS", 80000),
         sample_batch_size=config.get("BATCH_SIZE", 32),
-        # add_batches=True,
         add_sequences=False,
         add_batch_size=config["NUM_ENVS"],
     )
@@ -323,11 +308,17 @@ def single_run(config: dict):
             new_state = u_state.apply_gradients(grads=grads)
 
             return (new_state, u_key), (loss, q_val)
+        
+        def scanned_update(carry):
+            # take gradient_steps in one go, if -1: we do as many gradient steps as collected samples
+            carry, (loss, qval) = jax.lax.scan(do_update, carry, None, length=gradient_steps)
+            return carry, (loss[-1], qval[-1])
 
-        # train NN if we have enough samples in the replay buffer 
+        
+        # train NN if we have enough samples in the replay buffer (==learning_starts) 
         (agent_state, rng), (loss, q_val) = jax.lax.cond(
             replay_buffer.can_sample(buffer_state),
-            lambda c: do_update(c, None),
+            lambda c: scanned_update(c),
             lambda c: (c, (jnp.array(0.0), jnp.array(0.0))),
             (agent_state, rng),
         )

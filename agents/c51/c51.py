@@ -407,6 +407,7 @@ def single_run(config: dict):
 
     # warmup to trigger compilation
     _ = jax.block_until_ready(scanned_steps(c51_carry))
+    del _  # the warmup carry holds a second copy of the replay buffer
     end_compile = time.perf_counter()
     print(f"[c51] compilation time: {end_compile - start_compile:.2f}s")
     steps_per_iteration = config.get("NUM_ENVS") * config.get("TRAIN_FREQUENCY") * config.get("SCAN_STEPS")

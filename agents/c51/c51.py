@@ -398,6 +398,8 @@ def single_run(config: dict):
     start_compile = time.perf_counter()
     global_step = jnp.array(0, dtype=jnp.int32)
     c51_carry = (agent_state, buffer_state, _state, _obs, key, global_step)
+    # the carry owns these now; the stale names would pin a second replay buffer
+    del buffer_state, _state, _obs
 
     @jax.jit
     def scanned_steps(carry):

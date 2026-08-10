@@ -410,18 +410,15 @@ def single_run(config: dict):
     start_compile = time.perf_counter()
     global_step = jnp.array(0, dtype=jnp.int32)
     c51_carry = (agent_state, buffer_state, _state, _obs, key, global_step)
-    # the carry owns these now; the stale names would pin a second replay buffer
-    del buffer_state, _state, _obs
 
-    @jax.jit
     def scanned_steps(carry):
         def step_fn(c, _):
             return full_c51_step(*c)
         return jax.lax.scan(step_fn, carry, None, length=config.get("SCAN_STEPS", 1000))
 
-    # warmup to trigger compilation
-    _ = jax.block_until_ready(scanned_steps(c51_carry))
-    del _  # the warmup carry holds a second copy of the replay buffer
+    # donate the carry so XLA writes the new replay buffer over the old one instead of
+    # allocating a second copy; lower/compile AOT so nothing is donated before the loop
+    compiled = jax.jit(scanned_steps, donate_argnums=(0,)).lower(c51_carry).compile()
     end_compile = time.perf_counter()
     print(f"[c51] compilation time: {end_compile - start_compile:.2f}s")
     steps_per_iteration = config.get("NUM_ENVS") * config.get("TRAIN_FREQUENCY") * config.get("SCAN_STEPS")
@@ -435,7 +432,7 @@ def single_run(config: dict):
         if config["EVAL_DURING_TRAIN"] and iteration > 0 and iteration % config["EVAL_EVERY"] == 0:
             save_and_eval(global_step)
         iteration_time_start = time.perf_counter()
-        result = scanned_steps(c51_carry)
+        result = compiled(c51_carry)
         c51_carry, (infos, loss, q_val) = result
         global_step = int(c51_carry[-1])
         print(f"[c51] iteration {iteration} | global_step {global_step} | avg_return {infos['returned_episode_returns'][-1].mean():.2f} | avg_length {infos['returned_episode_lengths'][-1].mean():.2f} | td_loss {loss[-1]:.4f} | q_val {q_val[-1]:.4f} | SPS {int(global_step / (time.perf_counter() - run_time))} | SPS_update {int(config['NUM_ENVS'] * config['TRAIN_FREQUENCY'] * config['SCAN_STEPS'] / (time.perf_counter() - iteration_time_start))}")

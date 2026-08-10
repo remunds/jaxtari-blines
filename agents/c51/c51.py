@@ -191,8 +191,7 @@ def single_run(config: dict):
     dummy_obs = jnp.zeros((1, *obs_shape))
     q_params = network.init(q_key, dummy_obs)
 
-    # CleanRL C51 uses eps = 0.01 / batch_size, not optax's 1e-8 default
-    tx = optax.adam(learning_rate=config.get("LEARNING_RATE"), eps=config.get("ADAM_EPS", 0.01 / batch_size))
+    tx = optax.adam(learning_rate=config.get("LEARNING_RATE"), eps=config.get("ADAM_EPS", 0.00015))
 
     agent_state = C51TrainState.create(
         apply_fn=network.apply,

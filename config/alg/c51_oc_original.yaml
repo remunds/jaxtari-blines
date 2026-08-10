@@ -13,6 +13,7 @@ GRADIENT_STEPS: 1 # -1 == n_envs * train_freq (== collected_steps)
 
 NUM_ENVS: 1
 LEARNING_RATE: 2.5e-4
+ADAM_EPS: 3.125e-4 # CleanRL C51: 0.01 / BATCH_SIZE
 BATCH_SIZE: 32
 TRAIN_FREQUENCY: 4
 GAMMA: 0.99

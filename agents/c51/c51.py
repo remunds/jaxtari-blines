@@ -83,11 +83,15 @@ class C51CNNNetwork(nn.Module):
         x = jnp.transpose(x, (0, 2, 3, 1))
         x = x.astype(jnp.float32)
         x = x / 255.0
-        x = nn.relu(nn.Conv(32, kernel_size=(8, 8), strides=(4, 4), padding="VALID")(x))
-        x = nn.relu(nn.Conv(64, kernel_size=(4, 4), strides=(2, 2), padding="VALID")(x))
-        x = nn.relu(nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding="VALID")(x))
+        x = nn.Conv(32, kernel_size=(8, 8), strides=(4, 4), padding="VALID")(x)
+        x = nn.relu(x)
+        x = nn.Conv(64, kernel_size=(4, 4), strides=(2, 2), padding="VALID")(x)
+        x = nn.relu(x)
+        x = nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding="VALID")(x)
+        x = nn.relu(x)
         x = x.reshape((x.shape[0], -1))
-        x = nn.relu(nn.Dense(512)(x))
+        x = nn.Dense(512)(x)
+        x = nn.relu(x)
         x = nn.Dense(self.action_dim * self.n_atoms)(x)
         x = x.reshape((x.shape[0], self.action_dim, self.n_atoms))
         return nn.softmax(x, axis=-1)
@@ -99,7 +103,6 @@ class C51MLPNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = x.astype(jnp.float32)
         x = nn.Dense(461, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.relu(x)
         x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
@@ -111,7 +114,6 @@ class C51MLPNetwork(nn.Module):
 
 class C51TrainState(TrainState):
     target_params: flax.core.FrozenDict
-    atoms: jnp.ndarray
 
 
 @flax.struct.dataclass
@@ -175,15 +177,15 @@ def single_run(config: dict):
         next_done = jnp.logical_or(terminated, truncated)
         return next_obs.reshape(action.shape[0], *obs_shape), state, reward, next_done, info
 
+    gamma = config.get("GAMMA", 0.99)
+    batch_size = config.get("BATCH_SIZE", 32)
+    total_timesteps = config.get("TOTAL_TIMESTEPS", 10000000)
+
     n_atoms = config.get("N_ATOMS", 51)
     v_min = config.get("V_MIN", -10.0)
     v_max = config.get("V_MAX", 10.0)
     atoms = jnp.linspace(v_min, v_max, n_atoms)
     delta_z = (v_max - v_min) / (n_atoms - 1)
-
-    gamma = config.get("GAMMA", 0.99)
-    batch_size = config.get("BATCH_SIZE", 32)
-    total_timesteps = config.get("TOTAL_TIMESTEPS", 10000000)
 
     key, q_key = jax.random.split(key, 2)
     network = C51CNNNetwork(action_dim=action_dim, n_atoms=n_atoms) if config.get("PIXEL_BASED", True) else C51MLPNetwork(action_dim=action_dim, n_atoms=n_atoms)
@@ -191,23 +193,22 @@ def single_run(config: dict):
     dummy_obs = jnp.zeros((1, *obs_shape))
     q_params = network.init(q_key, dummy_obs)
 
-    tx = optax.adam(learning_rate=config.get("LEARNING_RATE"), eps=config.get("ADAM_EPS", 0.00015))
+    # CleanRL C51 uses eps = 0.01 / batch_size
+    tx = optax.adam(learning_rate=config.get("LEARNING_RATE"), eps=0.01 / batch_size)
 
     agent_state = C51TrainState.create(
         apply_fn=network.apply,
         params=q_params,
         target_params=jax.tree.map(jnp.copy, q_params),
-        atoms=atoms,
         tx=tx,
     )
 
-    # uniform sampling: C51 has no prioritised replay
-    replay_buffer = fbx.make_flat_buffer(
+    replay_buffer = fbx.make_prioritised_flat_buffer(
         max_length=config.get("BUFFER_SIZE", 1000000),
         min_length=config.get("LEARNING_STARTS", 80000),
-        sample_batch_size=batch_size,
+        sample_batch_size=config.get("BATCH_SIZE", 32),
         add_sequences=False,
-        add_batch_size=num_envs,
+        add_batch_size=config["NUM_ENVS"],
     )
     replay_buffer = replay_buffer.replace(
         init=jax.jit(replay_buffer.init),
@@ -237,7 +238,7 @@ def single_run(config: dict):
             )
 
             pmfs = agent_state.apply_fn(agent_state.params, obs)
-            q_values = (pmfs * agent_state.atoms[None, None, :]).sum(-1)
+            q_values = (pmfs * atoms[None, None, :]).sum(-1)
             greedy_actions = q_values.argmax(axis=-1)
             random_actions = jax.random.randint(action_rng, (num_envs,), 0, action_dim)
 
@@ -253,10 +254,10 @@ def single_run(config: dict):
                 done=next_done,
             )
             buffer_state = replay_buffer.add(buffer_state, timestep)
-            return (agent_state, buffer_state, next_env_state, next_obs, global_step + num_envs, rng), (info, epsilon)
+            return (agent_state, buffer_state, next_env_state, next_obs, global_step + num_envs, rng), info
 
         # take TRAIN_FREQUENCY steps in one go
-        (agent_state, buffer_state, next_env_state, next_obs, global_step, rng), (infos, epsilons) = jax.lax.scan(
+        (agent_state, buffer_state, next_env_state, next_obs, global_step, rng), infos = jax.lax.scan(
             take_action,
             (agent_state, buffer_state, env_state, obs, global_step, rng),
             None,
@@ -269,19 +270,19 @@ def single_run(config: dict):
 
             batch = replay_buffer.sample(buffer_state, sample_key).experience
             b_obs = batch.first.obs
-            b_act = batch.first.action.reshape(-1)
+            b_act = batch.first.action
             b_rew = batch.first.reward
-            b_don = batch.first.done.astype(jnp.float32)
+            b_don = batch.first.done
             b_nobs = batch.second.obs
 
             # greedy next action under the target network (no double-Q in C51)
             next_pmfs = u_state.apply_fn(u_state.target_params, b_nobs)
-            next_q = (next_pmfs * u_state.atoms[None, None, :]).sum(-1)
+            next_q = (next_pmfs * atoms[None, None, :]).sum(-1)
             next_action = jnp.argmax(next_q, axis=-1)
             next_pmfs = next_pmfs[jnp.arange(batch_size), next_action]
 
             # categorical projection onto the fixed atom support
-            next_atoms = b_rew[:, None] + gamma * u_state.atoms[None, :] * (1.0 - b_don[:, None])
+            next_atoms = b_rew[:, None] + gamma * atoms[None, :] * (1.0 - b_don[:, None])
             tz = jnp.clip(next_atoms, v_min, v_max)
             b = (tz - v_min) / delta_z
             l = jnp.clip(jnp.floor(b).astype(jnp.int32), 0, n_atoms - 1)
@@ -299,15 +300,15 @@ def single_run(config: dict):
             target_pmfs = jax.lax.fori_loop(0, batch_size, project_sample, target_pmfs)
             target_pmfs = jax.lax.stop_gradient(target_pmfs)
 
-            def loss_fn(params):
+            def q_loss_fn(params):
                 pmfs = u_state.apply_fn(params, b_obs)
-                p = pmfs[jnp.arange(batch_size), b_act]
+                p = pmfs[jnp.arange(batch_size), b_act.reshape(-1)]
                 p = jnp.clip(p, 1e-5, 1 - 1e-5)
                 loss = (-(target_pmfs * jnp.log(p)).sum(-1)).mean()
-                q_val = (p * u_state.atoms[None, :]).sum(-1).mean()
+                q_val = (p * atoms[None, :]).sum(-1).mean()
                 return loss, q_val
 
-            (loss, q_val), grads = jax.value_and_grad(loss_fn, has_aux=True)(u_state.params)
+            (loss, q_val), grads = jax.value_and_grad(q_loss_fn, has_aux=True)(u_state.params)
             new_state = u_state.apply_gradients(grads=grads)
 
             return (new_state, u_key), (loss, q_val)
@@ -327,7 +328,7 @@ def single_run(config: dict):
         steps_per_update = config.get("TRAIN_FREQUENCY", 4) * config.get("NUM_ENVS", 1)
         update_target_flag = jnp.logical_and(
             replay_buffer.can_sample(buffer_state),
-            (global_step % config.get("TARGET_NETWORK_FREQUENCY", 10000)) < steps_per_update
+            (global_step % config.get("TARGET_NETWORK_FREQUENCY", 1000)) < steps_per_update
         )
         new_target_params = jax.lax.cond(
             update_target_flag,
@@ -337,14 +338,21 @@ def single_run(config: dict):
         )
         agent_state = agent_state.replace(target_params=new_target_params)
 
-        return (agent_state, buffer_state, next_env_state, next_obs, rng, global_step), (infos, loss, q_val, epsilons[-1])
+        return (agent_state, buffer_state, next_env_state, next_obs, rng, global_step), (infos, loss, q_val)
 
     def save_and_eval(step_count):
         if config.get("SAVE_PATH", "./models") is not None:
             model_path = f'{config.get("SAVE_PATH", "./models")}/{run_name}/{config["EXP_NAME"]}_{step_count}_{int(time.time())}.cleanrl_model'
             os.makedirs(os.path.dirname(model_path), exist_ok=True)
             with open(model_path, "wb") as f:
-                f.write(flax.serialization.to_bytes([config, c51_carry[0].params]))
+                f.write(
+                    flax.serialization.to_bytes(
+                        [
+                            config,
+                            c51_carry[0].params
+                         ]
+                    )
+                )
             print(f"model saved to {model_path}")
 
         print(f"running evaluation at step {step_count}...")
@@ -388,7 +396,12 @@ def single_run(config: dict):
                 # shape: (N, H, W, C) -> (N, C, H, W)
                 frames = jnp.transpose(frames, (0, 3, 1, 2))
                 video = wandb.Video(np.array(frames), fps=30, format="mp4")
-                wandb.log({f"eval/video_{mod_label}": video}, step=step_count)
+                wandb.log(
+                    {
+                        f"eval/video_{mod_label}": video,
+                    },
+                    step=step_count,
+                )
                 print(f"Video (eval) logged to wandb with {frames.shape[0]} frames ({mod_label}).")
         return metrics
 
@@ -422,17 +435,17 @@ def single_run(config: dict):
         if config["EVAL_DURING_TRAIN"] and iteration > 0 and iteration % config["EVAL_EVERY"] == 0:
             save_and_eval(global_step)
         iteration_time_start = time.perf_counter()
-        c51_carry, (infos, loss, q_val, epsilon) = scanned_steps(c51_carry)
+        result = scanned_steps(c51_carry)
+        c51_carry, (infos, loss, q_val) = result
         global_step = int(c51_carry[-1])
-        print(f"[c51] iteration {iteration} | global_step {global_step} | avg_return {infos['returned_episode_returns'][-1].mean():.2f} | avg_length {infos['returned_episode_lengths'][-1].mean():.2f} | td_loss {loss[-1]:.4f} | q_val {q_val[-1]:.4f} | epsilon {epsilon[-1]:.3f} | SPS {int(global_step / (time.perf_counter() - run_time))} | SPS_update {int(steps_per_iteration / (time.perf_counter() - iteration_time_start))}")
+        print(f"[c51] iteration {iteration} | global_step {global_step} | avg_return {infos['returned_episode_returns'][-1].mean():.2f} | avg_length {infos['returned_episode_lengths'][-1].mean():.2f} | td_loss {loss[-1]:.4f} | q_val {q_val[-1]:.4f} | SPS {int(global_step / (time.perf_counter() - run_time))} | SPS_update {int(config['NUM_ENVS'] * config['TRAIN_FREQUENCY'] * config['SCAN_STEPS'] / (time.perf_counter() - iteration_time_start))}")
         metrics = {
             "charts/avg_episodic_return": infos["returned_episode_returns"][-1].mean(),
             "charts/avg_episodic_length": infos["returned_episode_lengths"][-1].mean(),
             "losses/td_loss": loss[-1].item(),
             "losses/q_values": q_val[-1].item(),
-            "charts/epsilon": epsilon[-1].item(),
             "charts/SPS": int(global_step / (time.perf_counter() - run_time)),
-            "charts/SPS_update": int(steps_per_iteration / (time.perf_counter() - iteration_time_start)),
+            "charts/SPS_update": int(config["NUM_ENVS"] * config["TRAIN_FREQUENCY"] * config["SCAN_STEPS"] / (time.perf_counter() - iteration_time_start)),
             "charts/time": time.perf_counter() - run_time,
             "charts/global_step": global_step,
         }

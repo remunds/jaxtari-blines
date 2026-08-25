@@ -203,7 +203,8 @@ def single_run(config: dict):
         tx=tx,
     )
 
-    replay_buffer = fbx.make_prioritised_flat_buffer(
+    # uniform sampling: C51 has no prioritised replay
+    replay_buffer = fbx.make_flat_buffer(
         max_length=config.get("BUFFER_SIZE", 1000000),
         min_length=config.get("LEARNING_STARTS", 80000),
         sample_batch_size=config.get("BATCH_SIZE", 32),

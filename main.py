@@ -17,8 +17,11 @@ def main(config):
         elif merged_config["ALG"] == "DQN":  
             from agents.dqn.dqn import single_run  
             run_fn = single_run
-        elif merged_config["ALG"] == "RAINBOW":  
-            from agents.rainbow.rainbow import single_run  
+        elif merged_config["ALG"] == "RAINBOW":
+            from agents.rainbow.rainbow import single_run
+            run_fn = single_run
+        elif merged_config["ALG"] == "SAC_CALE":
+            from agents.sac_cale.sac import single_run
             run_fn = single_run
         elif merged_config["ALG"] == "C51":
             from agents.c51.c51 import single_run

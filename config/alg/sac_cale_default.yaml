@@ -1,0 +1,59 @@
+ALG: SAC_CALE
+EXP_NAME: sac_cale
+
+PIXEL_BASED: False
+NATIVE_DOWNSCALING: True
+
+TOTAL_TIMESTEPS: 400000
+BUFFER_SIZE: 100000
+LEARNING_STARTS: 10000
+SCAN_STEPS: 10000
+
+NUM_ENVS: 1
+BATCH_SIZE: 64
+GAMMA: 0.99
+TAU: 0.005
+ALPHA: 0.2
+AUTOTUNE: True
+
+POLICY_LR: 0.0003
+Q_LR: 0.0003
+ALPHA_LR: 0.0003
+ENCODER_LR: 0.0003
+POLICY_FREQUENCY: 1
+TARGET_NETWORK_FREQUENCY: 1
+
+REWARD_SCALE_FACTOR: 10.0
+
+# Alpha (entropy coefficient) autotune: soft penalty range for the learned log_alpha.
+# alpha = exp(log_alpha) is softly encouraged to stay within
+# [exp(LOG_ALPHA_MIN), exp(LOG_ALPHA_MAX)] via a quadratic penalty in the alpha loss.
+
+# Personal preference: -1.0 gives behavior that feels smoother and
+# more human-like to me in qualitative evaluation. Alpha below 0.368
+# incurs a penalty; in practice, alpha typically stays above ~0.066
+# and remains mostly around 0.075.  A lower bound can be chosen to
+# give the agent more freedom to adjust alpha.
+LOG_ALPHA_MIN: -1.0
+
+LOG_ALPHA_MAX: 5.0
+
+# CALE joystick deadzone threshold.
+# Values within this range [-TAU_CALE, TAU_CALE] are treated as zero (NOOP) to avoid unintended small inputs.
+TAU_CALE: 0.5
+
+# Keep the replay buffer on CPU to avoid exhausting GPU VRAM.
+# Set to False to keep it on GPU (faster but uses much more VRAM).
+BUFFER_ON_CPU: True
+
+# Number of transitions to accumulate on GPU before transferring the whole
+# batch to CPU and calling buffer.add once.
+FILL_BATCH_SIZE: 256
+
+# Accumulating a few transitions on GPU and flushing them together reduces
+# the number of expensive buffer.add calls by a factor of TRAIN_ADD_BATCH_SIZE.
+TRAIN_ADD_BATCH_SIZE: 32
+
+# max number of frames per eval video; bounds the memory used while rendering
+# (1800 frames = 60s at 30fps, enough to inspect an episode)
+VIDEO_MAX_FRAMES: 1800

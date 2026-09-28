@@ -1,0 +1,23 @@
+# SCoBots' own PPO setup: github.com/k4ntz/SCoBots train.py (object-centric
+# branch, SB3 PPO + MlpPolicy with pi/vf = [64, 64] ReLU), run with `-env 8`.
+ALG: SCOBOTS
+EXP_NAME: scobots_original
+
+REWARD_MODE: 0 # 0: env, 1: concept reward only ("human"), 2: both ("mixed")
+HIDDEN_DIMS: [64, 64]
+
+TOTAL_TIMESTEPS: 2e7
+LEARNING_RATE: 1e-3 # SCoBots uses 2.5e-4 for tennis (alg.LEARNING_RATE=2.5e-4)
+NUM_ENVS: 8
+NUM_STEPS: 2048
+ANNEAL_LR: True
+GAMMA: 0.99
+GAE_LAMBDA: 0.95
+NUM_MINIBATCHES: 64 # SB3 batch_size 256 = 8 * 2048 / 64
+UPDATE_EPOCHS: 3
+NORM_ADV: True
+CLIP_COEF: 0.1
+ANNEAL_CLIP: True
+ENT_COEF: 0.01
+VF_COEF: 2.0 # SB3's vf_coef=1 on an MSE without the 0.5 factor used here
+MAX_GRAD_NORM: 0.5

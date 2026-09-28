@@ -26,3 +26,5 @@ EVAL_DURING_TRAIN: False
 EVAL_EVERY: 100 # measured in alg iterations, not env steps
 # whether to capture a video during eval
 CAPTURE_VIDEO: True
+# cap eval video length; long-episode games (enduro, breakout) otherwise OOM the GPU
+VIDEO_MAX_FRAMES: 1800

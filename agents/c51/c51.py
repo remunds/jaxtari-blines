@@ -118,19 +118,34 @@ class C51TrainState(TrainState):
 
 @flax.struct.dataclass
 class TimeStep:
-    obs: jnp.array
-    action: jnp.array
-    reward: jnp.array
-    done: jnp.array
+    obs: jax.Array
+    action: jax.Array
+    reward: jax.Array
+    done: jax.Array
 
 
 def single_run(config: dict):
     config = {k.upper(): v for k, v in config.items() if k != "alg"}
 
-    if config.get("PIXEL_BASED", True) and config.get("NUM_ENVS", 1) > 16:
-        print("Warning: More than 16 environments may cause OOM on GPU when using pixel-based observations.")
+    # read every key used more than once up front, so each default lives in one place
+    pixel_based = config.get("PIXEL_BASED", True)
+    native_downscaling = config.get("NATIVE_DOWNSCALING", True)
+    num_envs = config.get("NUM_ENVS", 1)
+    train_frequency = config.get("TRAIN_FREQUENCY", 4)
+    scan_steps = config.get("SCAN_STEPS", 1000)
+    total_timesteps = config.get("TOTAL_TIMESTEPS", 10000000)
+    batch_size = config.get("BATCH_SIZE", 32)
+    gamma = config.get("GAMMA", 0.99)
+    n_atoms = config.get("N_ATOMS", 51)
+    v_min = config.get("V_MIN", -10.0)
+    v_max = config.get("V_MAX", 10.0)
+    save_path = config.get("SAVE_PATH", "./models")
 
-    run_name = f"{config['ENV_ID']}_{config['EXP_NAME']}_{'oc' if not config['PIXEL_BASED'] else 'pixel'}_{config['SEED']}"
+    # env steps collected by one full_c51_step, and by one compiled call of scanned_steps
+    steps_per_update = num_envs * train_frequency
+    steps_per_iteration = steps_per_update * scan_steps
+
+    run_name = f"{config['ENV_ID']}_{config['EXP_NAME']}_{'pixel' if pixel_based else 'oc'}_{config['SEED']}"
 
     wandb.init(
         project=config.get("PROJECT", "jaxtari-blines"),
@@ -152,19 +167,20 @@ def single_run(config: dict):
     env = make_env(
         config.get("ENV_ID"),
         train_mods,
-        config.get("PIXEL_BASED", True),
-        config.get("NATIVE_DOWNSCALING", True),
+        pixel_based,
+        native_downscaling,
         False,
     )()
 
     action_dim = env.action_space().n
     obs_shape = env.observation_space().shape
-    if config.get("PIXEL_BASED", True):
+    if pixel_based:
         obs_shape = obs_shape[:-1]
 
-    num_envs = config["NUM_ENVS"]
     # if -1: we do as many gradient steps as collected samples (stable_baselines3 behavior)
-    gradient_steps = num_envs * config.get("TRAIN_FREQUENCY", 4) if config.get("GRADIENT_STEPS", 1) == -1 else config.get("GRADIENT_STEPS", 1)
+    gradient_steps = config.get("GRADIENT_STEPS", 1)
+    if gradient_steps == -1:
+        gradient_steps = steps_per_update
 
     @jax.jit
     def vmap_reset(rng):
@@ -177,24 +193,18 @@ def single_run(config: dict):
         next_done = jnp.logical_or(terminated, truncated)
         return next_obs.reshape(action.shape[0], *obs_shape), state, reward, next_done, info
 
-    gamma = config.get("GAMMA", 0.99)
-    batch_size = config.get("BATCH_SIZE", 32)
-    total_timesteps = config.get("TOTAL_TIMESTEPS", 10000000)
-
-    n_atoms = config.get("N_ATOMS", 51)
-    v_min = config.get("V_MIN", -10.0)
-    v_max = config.get("V_MAX", 10.0)
     atoms = jnp.linspace(v_min, v_max, n_atoms)
     delta_z = (v_max - v_min) / (n_atoms - 1)
 
     key, q_key = jax.random.split(key, 2)
-    network = C51CNNNetwork(action_dim=action_dim, n_atoms=n_atoms) if config.get("PIXEL_BASED", True) else C51MLPNetwork(action_dim=action_dim, n_atoms=n_atoms)
+    Network = C51CNNNetwork if pixel_based else C51MLPNetwork
+    network = Network(action_dim=action_dim, n_atoms=n_atoms)
 
     dummy_obs = jnp.zeros((1, *obs_shape))
     q_params = network.init(q_key, dummy_obs)
 
     # CleanRL C51 uses eps = 0.01 / batch_size
-    tx = optax.adam(learning_rate=config.get("LEARNING_RATE"), eps=0.01 / batch_size)
+    tx = optax.adam(learning_rate=config.get("LEARNING_RATE", 2.5e-4), eps=0.01 / batch_size)
 
     agent_state = C51TrainState.create(
         apply_fn=network.apply,
@@ -207,9 +217,9 @@ def single_run(config: dict):
     replay_buffer = fbx.make_flat_buffer(
         max_length=config.get("BUFFER_SIZE", 1000000),
         min_length=config.get("LEARNING_STARTS", 80000),
-        sample_batch_size=config.get("BATCH_SIZE", 32),
+        sample_batch_size=batch_size,
         add_sequences=False,
-        add_batch_size=config["NUM_ENVS"],
+        add_batch_size=num_envs,
     )
     replay_buffer = replay_buffer.replace(
         init=jax.jit(replay_buffer.init),
@@ -262,7 +272,7 @@ def single_run(config: dict):
             take_action,
             (agent_state, buffer_state, env_state, obs, global_step, rng),
             None,
-            length=config.get("TRAIN_FREQUENCY", 4),
+            length=train_frequency,
         )
 
         def do_update(update_carry, _):
@@ -326,7 +336,6 @@ def single_run(config: dict):
             lambda c: (c, (jnp.array(0.0), jnp.array(0.0))),
             (agent_state, rng),
         )
-        steps_per_update = config.get("TRAIN_FREQUENCY", 4) * config.get("NUM_ENVS", 1)
         update_target_flag = jnp.logical_and(
             replay_buffer.can_sample(buffer_state),
             (global_step % config.get("TARGET_NETWORK_FREQUENCY", 1000)) < steps_per_update
@@ -341,32 +350,23 @@ def single_run(config: dict):
 
         return (agent_state, buffer_state, next_env_state, next_obs, rng, global_step), (infos, loss, q_val)
 
-    def save_and_eval(step_count):
-        if config.get("SAVE_PATH", "./models") is not None:
-            model_path = f'{config.get("SAVE_PATH", "./models")}/{run_name}/{config["EXP_NAME"]}_{step_count}_{int(time.time())}.cleanrl_model'
+    def save_and_eval(step_count, params):
+        if save_path is not None:
+            model_path = f'{save_path}/{run_name}/{config["EXP_NAME"]}_{step_count}_{int(time.time())}.cleanrl_model'
             os.makedirs(os.path.dirname(model_path), exist_ok=True)
             with open(model_path, "wb") as f:
-                f.write(
-                    flax.serialization.to_bytes(
-                        [
-                            config,
-                            c51_carry[0].params
-                         ]
-                    )
-                )
+                f.write(flax.serialization.to_bytes([config, params]))
             print(f"model saved to {model_path}")
 
         print(f"running evaluation at step {step_count}...")
 
         # evaluate across all mods (and default train env)
-        eval_mods = config["EVAL_MODS"] if len(config["EVAL_MODS"]) > 0 else config["TRAIN_MODS"]
+        eval_mods = config.get("EVAL_MODS", []) or config.get("TRAIN_MODS", [])
         eval_configs = [([], "default")]
-        if len(eval_mods) > 0:
-            mods_list = list(eval_mods)
-            for mod in mods_list:
-                mods_config = [mod] if not isinstance(mod, (list, tuple)) else list(mod)
-                mod_label = mod if isinstance(mod, str) else "_".join(str(m) for m in mods_config)
-                eval_configs.append((mods_config, mod_label))
+        for mod in eval_mods:
+            mods_config = [mod] if not isinstance(mod, (list, tuple)) else list(mod)
+            mod_label = mod if isinstance(mod, str) else "_".join(str(m) for m in mods_config)
+            eval_configs.append((mods_config, mod_label))
 
         metrics = {}
         for mods_cfg, mod_label in eval_configs:
@@ -375,39 +375,46 @@ def single_run(config: dict):
                 partial(
                     make_env,
                     mods=mods_cfg,
-                    pixel_based=config["PIXEL_BASED"],
-                    native_downscaling=config["NATIVE_DOWNSCALING"],
+                    pixel_based=pixel_based,
+                    native_downscaling=native_downscaling,
                     eval=True,
                 ),
                 config["ENV_ID"],
                 eval_episodes=10,
-                Model=C51CNNNetwork if config["PIXEL_BASED"] else C51MLPNetwork,
+                Model=Network,
                 n_atoms=n_atoms,
                 v_min=v_min,
                 v_max=v_max,
                 seed=config["SEED"] + 42,  # use a different seed for evaluation
+                epsilon=0.0,  # JAXtari protocol evaluates greedy policies
             )
             metrics[mod_label] = np.mean(jax.device_get(episodic_returns))
-            wandb.log({f"eval/episodic_return_{mod_label}": np.mean(jax.device_get(episodic_returns))}, step=step_count)
+            wandb.log({f"eval/episodic_return_{mod_label}": metrics[mod_label]}, step=step_count)
 
-            if config["CAPTURE_VIDEO"]:
-                # Instantiate a clean renderer immune to the training env's downscaling
-                clean_renderer = jaxatari.make(config["ENV_ID"], mods=mods_cfg).renderer
-                frames = jax.vmap(clean_renderer.render)(env_states)
-                # shape: (N, H, W, C) -> (N, C, H, W)
-                frames = jnp.transpose(frames, (0, 3, 1, 2))
-                video = wandb.Video(np.array(frames), fps=30, format="mp4")
-                wandb.log(
-                    {
-                        f"eval/video_{mod_label}": video,
-                    },
-                    step=step_count,
-                )
-                print(f"Video (eval) logged to wandb with {frames.shape[0]} frames ({mod_label}).")
+            if config.get("CAPTURE_VIDEO", True):
+                # Long-episode games (enduro, breakout) return tens of thousands of
+                # states here. Rendering them all at full resolution on the GPU OOMs
+                # against the replay buffer, so cap the length and build the clip on
+                # the host. A failed video must never lose the run's eval metrics.
+                try:
+                    max_frames = config.get("VIDEO_MAX_FRAMES", 1800)
+                    clipped_states = jax.tree_util.tree_map(lambda x: x[:max_frames], env_states)
+                    cpu = jax.devices("cpu")[0]
+                    with jax.default_device(cpu):
+                        clipped_states = jax.device_put(clipped_states, cpu)
+                        # Instantiate a clean renderer immune to the training env's downscaling
+                        clean_renderer = jaxatari.make(config["ENV_ID"], mods=mods_cfg).renderer
+                        frames = jax.vmap(clean_renderer.render)(clipped_states)
+                        # shape: (N, H, W, C) -> (N, C, H, W)
+                        frames = jnp.transpose(frames, (0, 3, 1, 2))
+                    video = wandb.Video(np.array(frames), fps=30, format="mp4")
+                    wandb.log({f"eval/video_{mod_label}": video}, step=step_count)
+                    print(f"Video (eval) logged to wandb with {frames.shape[0]} frames ({mod_label}).")
+                except Exception as e:
+                    print(f"[WARNING] video capture skipped for {mod_label}: {type(e).__name__}: {e}")
         return metrics
 
-    # we step n_envs each iteration
-    print(f"[c51] start compile...")
+    print("[c51] start compile...")
     start_compile = time.perf_counter()
     global_step = jnp.array(0, dtype=jnp.int32)
     c51_carry = (agent_state, buffer_state, _state, _obs, key, global_step)
@@ -415,40 +422,41 @@ def single_run(config: dict):
     def scanned_steps(carry):
         def step_fn(c, _):
             return full_c51_step(*c)
-        return jax.lax.scan(step_fn, carry, None, length=config.get("SCAN_STEPS", 1000))
+        return jax.lax.scan(step_fn, carry, None, length=scan_steps)
 
     # donate the carry so XLA writes the new replay buffer over the old one instead of
     # allocating a second copy; lower/compile AOT so nothing is donated before the loop
     compiled = jax.jit(scanned_steps, donate_argnums=(0,)).lower(c51_carry).compile()
     end_compile = time.perf_counter()
     print(f"[c51] compilation time: {end_compile - start_compile:.2f}s")
-    steps_per_iteration = config.get("NUM_ENVS") * config.get("TRAIN_FREQUENCY") * config.get("SCAN_STEPS")
-    rtpt = RTPT(name_initials=config["NAME_INITIALS"], experiment_name=run_name, max_iterations=config.get("TOTAL_TIMESTEPS") // steps_per_iteration)
+    rtpt = RTPT(name_initials=config["NAME_INITIALS"], experiment_name=run_name, max_iterations=total_timesteps // steps_per_iteration)
     rtpt.start()
     run_time = time.perf_counter()
-    print(f"[c51] starting training for {config.get('TOTAL_TIMESTEPS')} steps...")
-    while global_step < config.get("TOTAL_TIMESTEPS"):
+    print(f"[c51] starting training for {total_timesteps} steps...")
+    while global_step < total_timesteps:
         rtpt.step()
         iteration = global_step // steps_per_iteration
-        if config["EVAL_DURING_TRAIN"] and iteration > 0 and iteration % config["EVAL_EVERY"] == 0:
-            save_and_eval(global_step)
+        if config.get("EVAL_DURING_TRAIN", False) and iteration > 0 and iteration % config.get("EVAL_EVERY", 100) == 0:
+            save_and_eval(global_step, c51_carry[0].params)
         iteration_time_start = time.perf_counter()
-        result = compiled(c51_carry)
-        c51_carry, (infos, loss, q_val) = result
+        c51_carry, (infos, loss, q_val) = compiled(c51_carry)
         global_step = int(c51_carry[-1])
-        print(f"[c51] iteration {iteration} | global_step {global_step} | avg_return {infos['returned_episode_returns'][-1].mean():.2f} | avg_length {infos['returned_episode_lengths'][-1].mean():.2f} | td_loss {loss[-1]:.4f} | q_val {q_val[-1]:.4f} | SPS {int(global_step / (time.perf_counter() - run_time))} | SPS_update {int(config['NUM_ENVS'] * config['TRAIN_FREQUENCY'] * config['SCAN_STEPS'] / (time.perf_counter() - iteration_time_start))}")
+        now = time.perf_counter()
+        sps = int(global_step / (now - run_time))
+        sps_update = int(steps_per_iteration / (now - iteration_time_start))
         metrics = {
             "charts/avg_episodic_return": infos["returned_episode_returns"][-1].mean(),
             "charts/avg_episodic_length": infos["returned_episode_lengths"][-1].mean(),
             "losses/td_loss": loss[-1].item(),
             "losses/q_values": q_val[-1].item(),
-            "charts/SPS": int(global_step / (time.perf_counter() - run_time)),
-            "charts/SPS_update": int(config["NUM_ENVS"] * config["TRAIN_FREQUENCY"] * config["SCAN_STEPS"] / (time.perf_counter() - iteration_time_start)),
-            "charts/time": time.perf_counter() - run_time,
+            "charts/SPS": sps,
+            "charts/SPS_update": sps_update,
+            "charts/time": now - run_time,
             "charts/global_step": global_step,
         }
+        print(f"[c51] iteration {iteration} | global_step {global_step} | avg_return {metrics['charts/avg_episodic_return']:.2f} | avg_length {metrics['charts/avg_episodic_length']:.2f} | td_loss {metrics['losses/td_loss']:.4f} | q_val {metrics['losses/q_values']:.4f} | SPS {sps} | SPS_update {sps_update}")
         wandb.log(metrics, step=global_step)
 
-    eval_metrics = save_and_eval(global_step + 1)
+    eval_metrics = save_and_eval(global_step + 1, c51_carry[0].params)
     wandb.finish()
     return eval_metrics

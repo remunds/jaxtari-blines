@@ -18,3 +18,6 @@ wandb/
 # IDEs
 .idea/
 CLAUDE.md
+
+# PDF files
+*.pdf

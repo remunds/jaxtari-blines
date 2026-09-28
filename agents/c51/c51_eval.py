@@ -8,6 +8,7 @@ import jax.numpy as jnp
 from jaxatari.environment import JaxEnvironment
 from jaxatari.wrappers import JaxatariWrapper
 
+
 def evaluate(
     model_path: str,
     make_env: Callable,
@@ -17,46 +18,43 @@ def evaluate(
     n_atoms: int = 51,
     v_min: float = -10.0,
     v_max: float = 10.0,
-    epsilon: float = 0.05,
+    epsilon: float = 0.0,
     seed: int = 1,
+    max_eval_steps: int = 27000,
 ):
-
     env: JaxEnvironment | JaxatariWrapper = make_env(env_id)()
-    _Network = Model
     atoms = jnp.linspace(v_min, v_max, n_atoms)
     key = jax.random.PRNGKey(seed)
 
     @jax.jit
     def wrapped_reset(key):
-        """wrappes the reset function of the environment to correct the observation shape"""
+        """wraps the reset function of the environment to correct the observation shape"""
         next_obs, state = env.reset(key)
         return next_obs.squeeze()[None, ...], state
 
     @jax.jit
     def wrapped_step(state, action):
-        """wrappes the step function of the environment to correct the observation shape"""
+        """wraps the step function of the environment to correct the observation shape"""
         next_obs, next_state, reward, terminated, truncated, info = env.step(state, action.squeeze())
         done = jnp.logical_or(terminated, truncated)
         return next_obs.squeeze()[None, ...], next_state, reward, done, info
 
     key, reset_key = jax.random.split(key)
     next_obs, handle = wrapped_reset(reset_key)
-    network = _Network(action_dim=env.action_space().n, n_atoms=n_atoms)
+    network = Model(action_dim=env.action_space().n, n_atoms=n_atoms)
 
     key, network_key = jax.random.split(key)
     dummy_obs = env.observation_space().sample(network_key).squeeze()[None, ...]
     q_params = network.init(network_key, dummy_obs)
 
-
     with open(model_path, "rb") as f:
-        (args, q_params) = flax.serialization.from_bytes((None, q_params), f.read())
+        (_, q_params) = flax.serialization.from_bytes((None, q_params), f.read())
 
     @jax.jit
     def get_action(q_params: flax.core.FrozenDict, next_obs: jnp.ndarray, key: jax.random.PRNGKey):
         pmfs = network.apply(q_params, next_obs)
         q_values = (pmfs * atoms[None, None, :]).sum(-1)
         greedy_action = jnp.argmax(q_values, axis=1)
-
 
         key, subkey = jax.random.split(key)
         random_action = jax.random.randint(subkey, greedy_action.shape, 0, env.action_space().n)
@@ -73,7 +71,7 @@ def evaluate(
 
         first_states = jax.tree.map(lambda x: x[0], env_state)
 
-        return (next_obs, env_state, keys), (first_states, done, reward, actions)
+        return (next_obs, env_state, keys), (first_states, done, reward)
 
     reset_keys = jax.random.split(key, eval_episodes)
     next_obs, env_states = jax.vmap(wrapped_reset)(reset_keys)
@@ -86,13 +84,15 @@ def evaluate(
 
     @jax.jit
     def scanned_step(carry):
-        carry, (first_states_chunk, dones_chunk, rewards_chunk, actions_chunk) = jax.lax.scan(
-            step_fn, carry, None, length=1000
-        )
-        return carry, (first_states_chunk, dones_chunk, rewards_chunk, actions_chunk)
+        return jax.lax.scan(step_fn, carry, None, length=1000)
 
-    while not jnp.all(done_ever):
-        carry, (first_states_chunk, dones_chunk, rewards_chunk, actions_chunk) = scanned_step(carry)
+    # A greedy policy can stall forever (e.g. standing still in montezumarevenge),
+    # so truncate like ALE does: 27k agent steps == 108k frames == 30 min of play.
+    # Unfinished episodes keep the return collected up to the cap.
+    steps_run = 0
+    while not jnp.all(done_ever) and steps_run < max_eval_steps:
+        steps_run += 1000
+        carry, (first_states_chunk, dones_chunk, rewards_chunk) = scanned_step(carry)
         all_first_states.append(first_states_chunk)
         all_dones.append(dones_chunk)
         all_rewards.append(rewards_chunk)
@@ -104,7 +104,9 @@ def evaluate(
     dones = jnp.concatenate(all_dones, axis=0)
     rewards = jnp.concatenate(all_rewards, axis=0)
 
-    first_done = jnp.argmax(dones, axis=0)
+    # argmax of an all-False column is 0, so an episode cut off by max_eval_steps
+    # would otherwise yield a one-frame video; replay it to the cap instead
+    first_done = jnp.where(jnp.any(dones, axis=0), jnp.argmax(dones, axis=0), dones.shape[0] - 1)
     has_finished = jax.lax.cummax(dones.astype(jnp.int32), axis=0)
 
     mask_after_first_done = jnp.pad(has_finished[:-1, :], ((1, 0), (0, 0)), constant_values=0)

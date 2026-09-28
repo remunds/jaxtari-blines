@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run_all_dqn.py — Distribute DQN experiments across GPUs evenly.
+run_multiple_exp.py — Distribute experiments across GPUs evenly.
 
 Every (env, config) pair is run in sequence by worker threads, one per GPU.
 When a GPU finishes its current experiment, it grabs the next from the queue.
@@ -16,9 +16,9 @@ invocations of this script started at the exact same instant can still both
 pick the same free GPU (there is no cross-process locking).
 
 Usage:
-    uv run python run_all_dqn.py --gpus 0 1 2 3
-    uv run python run_all_dqn.py --gpus 0,1,2,3
-    uv run python run_all_dqn.py --gpus 0 1          # only two GPUs
+    uv run python run_multiple_exp.py --gpus 0 1 2 3
+    uv run python run_multiple_exp.py --gpus 0,1,2,3
+    uv run python run_multiple_exp.py --gpus 0 1          # only two GPUs
 """
 
 from __future__ import annotations
@@ -31,39 +31,41 @@ import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from queue import Queue
+from queue import Empty, Queue
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Configure your experiment grid below
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ENVS: list[str] = [
-    # "freeway", 
-    # "kangaroo",
-    # "montezumarevenge",
-    # "mspacman",
-    # "phoenix", "pong", "qbert",
-    # "seaquest", "skiing",
-    # "tennis",
-    # "venture",
-    # "timepilot", "asteroids", "breakout", 
-    # "frostbite", "gravitar",
-    # "bankheist",
-    # "beamrider",
-    # "enduro", 
-
-    # Default DQN / Rainbow test
-    "frostbite", "mspacman", "phoenix", "pong" 
+    # JAXtari-15 split (paper Sec. 3, Fig. 4 / Fig. 8)
+    "asteroids",
+    "beamrider",
+    "breakout",
+    "enduro",
+    "freeway",
+    "frostbite",
+    "gravitar",
+    "kangaroo",
+    "montezumarevenge",
+    "mspacman",
+    "phoenix",
+    "pong",
+    "seaquest",
+    "skiing",
+    "tennis",
 ]
 
 CONFIGS: list[str] = [
+    # "c51_rgb_tuned",
+    "c51_oc_tuned",
     # "dqn_rgb_tuned",
     # "dqn_oc_tuned",
     # "rainbow_rgb_tuned",
     # "rainbow_oc_tuned",
     # "dqn_oc_original",
-    "dqn_rgb_original",
-    "rainbow_rgb_original",
+    # "dqn_rgb_original",
+    # "rainbow_rgb_original",
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -237,6 +239,7 @@ def run_experiment(exp: Experiment, gpu_id: int) -> int:
         "uv", "run", "python", "main.py",
         f"+alg={exp.config}",
         f"ENV_ID={exp.env}",
+        "ENTITY=null",
     ]
 
     print(f"[GPU {gpu_id:>3}] ▶  {exp.label}")
@@ -257,6 +260,20 @@ def run_experiment(exp: Experiment, gpu_id: int) -> int:
     return proc.returncode
 
 
+def detect_gpus() -> list[int]:
+    """Return every GPU index nvidia-smi reports, or [] if it cannot be queried."""
+    lines = _run_nvidia_smi(["--query-gpu=index", "--format=csv,noheader,nounits"])
+    if lines is None:
+        return []
+    ids: list[int] = []
+    for line in lines:
+        try:
+            ids.append(int(line.strip()))
+        except ValueError:
+            continue
+    return ids
+
+
 def _parse_gpus(raw: Sequence[str]) -> list[int]:
     """Accept '0 1 2 3' or '0,1,2,3'."""
     ids: list[int] = []
@@ -267,17 +284,21 @@ def _parse_gpus(raw: Sequence[str]) -> list[int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Distribute DQN experiments across GPUs evenly."
+        description="Distribute experiments across GPUs evenly."
     )
     parser.add_argument(
         "--gpus",
         nargs="+",
-        help="GPU IDs, e.g. '0 1 2 3' or '0,1,2,3'",
+        help="GPU IDs, e.g. '0 1 2 3' or '0,1,2,3'. Omit to use every GPU nvidia-smi reports.",
     )
     args = parser.parse_args()
-    if not args.gpus:
-        parser.error("--gpus is required, e.g. --gpus 0 1 2 3")
-    gpu_ids = sorted(set(_parse_gpus(args.gpus)))  # dedupe; threads share the queue anyway
+    if args.gpus:
+        gpu_ids = sorted(set(_parse_gpus(args.gpus)))  # dedupe; threads share the queue anyway
+    else:
+        gpu_ids = detect_gpus()
+        if not gpu_ids:
+            parser.error("no GPUs detected by nvidia-smi; pass --gpus explicitly")
+        print(f"[guard] --gpus not given; auto-detected {gpu_ids}")
 
     experiments = build_experiments(ENVS, CONFIGS)
     if not experiments:
@@ -300,7 +321,7 @@ def main() -> None:
     print()
 
     # -- shared work queue ----------------------------------------------------
-    queue: Queue[Experiment | None] = Queue()
+    queue: Queue[Experiment] = Queue()
     for exp in experiments:
         queue.put(exp)
 
@@ -313,7 +334,7 @@ def main() -> None:
         while True:
             try:
                 exp = queue.get_nowait()
-            except Exception:
+            except Empty:
                 return  # no more work
             try:
                 gpu_id = acquire_free_gpu(gpu_ids, in_use, guard)

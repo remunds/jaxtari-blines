@@ -106,19 +106,64 @@ class NoisyDense(nn.Module):
         return x @ kernel + bias
 
 
+class ImpalaResidualBlock(nn.Module):
+    channels: int
+
+    @nn.compact
+    def __call__(self, x):
+        inputs = x
+        x = nn.relu(x)
+        x = nn.Conv(self.channels, kernel_size=(3, 3), padding="SAME")(x)
+        x = nn.relu(x)
+        x = nn.Conv(self.channels, kernel_size=(3, 3), padding="SAME")(x)
+        return x + inputs
+
+
+class ImpalaConvSequence(nn.Module):
+    channels: int
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Conv(self.channels, kernel_size=(3, 3), padding="SAME")(x)
+        x = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding="SAME")
+        x = ImpalaResidualBlock(self.channels)(x)
+        x = ImpalaResidualBlock(self.channels)(x)
+        return x
+
+
+class ImpalaCNN(nn.Module):
+    channels: tuple = (16, 32, 32)
+
+    @nn.compact
+    def __call__(self, x):
+        x = jnp.transpose(x, (0, 2, 3, 1))          
+        x = x.astype(jnp.float32) / 255.0
+        for ch in self.channels:
+            x = ImpalaConvSequence(ch)(x)
+        x = nn.relu(x)
+        x = x.reshape((x.shape[0], -1))
+        x = nn.Dense(256)(x)
+        x = nn.relu(x)
+        return x
+
+    
 class RainbowCNNNetwork(nn.Module):
     action_dim: int
     n_atoms: int
     sigma0: float = 0.5
+    cnn_type: str = "nature"
 
     @nn.compact
     def __call__(self, x, deterministic=False):
-        x = jnp.transpose(x, (0, 2, 3, 1))
-        x = x.astype(jnp.float32) / 255.0
-        x = nn.relu(nn.Conv(32, kernel_size=(8, 8), strides=(4, 4), padding="VALID")(x))
-        x = nn.relu(nn.Conv(64, kernel_size=(4, 4), strides=(2, 2), padding="VALID")(x))
-        x = nn.relu(nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding="VALID")(x))
-        x = x.reshape((x.shape[0], -1))
+        if self.cnn_type == "impala":
+            x = ImpalaCNN()(x)
+        else:
+            x = jnp.transpose(x, (0, 2, 3, 1))
+            x = x.astype(jnp.float32) / 255.0
+            x = nn.relu(nn.Conv(32, (8, 8), (4, 4), padding="VALID")(x))
+            x = nn.relu(nn.Conv(64, (4, 4), (2, 2), padding="VALID")(x))
+            x = nn.relu(nn.Conv(64, (3, 3), (1, 1), padding="VALID")(x))
+            x = x.reshape((x.shape[0], -1))
 
         v = nn.relu(NoisyDense(512, self.sigma0)(x, deterministic))
         v = NoisyDense(self.n_atoms, self.sigma0)(v, deterministic)
@@ -226,7 +271,7 @@ def single_run(config: dict):
     sigma0 = config.get("NOISY_SIGMA0", 0.5)
 
     key, q_key, noise_key = jax.random.split(key, 3)
-    network = RainbowCNNNetwork(action_dim=action_dim, n_atoms=n_atoms, sigma0=sigma0) if config.get("PIXEL_BASED", True) else RainbowMLPNetwork(action_dim=action_dim, n_atoms=n_atoms, sigma0=sigma0)
+    network = RainbowCNNNetwork(action_dim=action_dim, n_atoms=n_atoms, sigma0=sigma0, cnn_type=config.get("CNN_TYPE", "nature")) if config.get("PIXEL_BASED", True) else RainbowMLPNetwork(action_dim=action_dim, n_atoms=n_atoms, sigma0=sigma0)
 
     dummy_obs = jnp.zeros((1, *obs_shape))
     q_params = network.init({"params": q_key, "noise": noise_key}, dummy_obs, False)
@@ -443,7 +488,7 @@ def single_run(config: dict):
                 ),
                 config["ENV_ID"],
                 eval_episodes=10,
-                Model=RainbowCNNNetwork if config["PIXEL_BASED"] else RainbowMLPNetwork,
+                Model=partial(RainbowCNNNetwork, cnn_type=config.get("CNN_TYPE", "nature")) if config.get("PIXEL_BASED", True) else RainbowMLPNetwork,
                 n_atoms=n_atoms,
                 v_min=v_min,
                 v_max=v_max,

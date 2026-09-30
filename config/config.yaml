@@ -26,3 +26,6 @@ EVAL_DURING_TRAIN: False
 EVAL_EVERY: 100 # measured in alg iterations, not env steps
 # whether to capture a video during eval
 CAPTURE_VIDEO: True
+
+# default cnn block for all pixel based runs, set to "impala" for impala style cnn
+CNN_TYPE: nature      

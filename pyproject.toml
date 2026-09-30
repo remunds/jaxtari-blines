@@ -9,8 +9,14 @@ dependencies = [
     "rtpt>=0.0.4",
     "wandb[media]>=0.27.0",
     "hydra-core>=1.3.2",
-    "jax[cuda12]", # use "jax" if no cuda available
+    "jax==0.10.2; sys_platform != 'darwin'",
+    "jax[cuda12]==0.10.2; sys_platform == 'linux'",
+    "jax==0.10.2; sys_platform == 'darwin'",
     "flashbax",
+# =======
+#     "jax", # use "jax" if no cuda available
+#     "flashbax"
+# >>>>>>> e8d76b3 (Implemented off policy learning algo double dqn)
 ]
 
 [tool.uv]

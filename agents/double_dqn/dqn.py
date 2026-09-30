@@ -1,0 +1,500 @@
+"""
+PureJaxRL version of CleanRL's DQN: https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/dqn_jax.py
+"""
+from functools import partial
+import time
+import os
+import random
+import jax
+import jax.numpy as jnp
+from jax.random import orthogonal
+import numpy as np
+import chex
+import flax
+import jaxatari
+from jaxatari.wrappers import AtariWrapper, FlattenObservationWrapper, LogWrapper, NormalizeObservationWrapper, ObjectCentricWrapper, PixelObsWrapper
+import wandb
+import optax
+import flax.linen as nn
+from flax.training.train_state import TrainState
+from agents.double_dqn.dqn_eval import evaluate_dqn
+import flashbax as fbx
+from agents.double_dqn.types import TimeStep
+from reward_machines.games.game_rm import GameRM
+from reward_machines.reward_machine import RewardMachine
+from reward_machines.reward_machine_wrapper import RewardMachineWrapper
+from reward_machines.rm_registry import GAME_RM_REGISTRY
+
+def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False, game_rm: GameRM | None=None, use_crm: bool = False, use_shaping: bool = False, gamma: float = 0.99):
+    assert mods is None or isinstance(mods, list), "mods must be None or a list of strings"
+    if mods is not None and len(mods) == 0:
+        mods = None
+    if not eval and mods is not None and len(mods) > 0:
+        print(f"[WARNING] Training on mods {mods}!")
+
+    def thunk():
+        active_mods = mods
+        if not eval and isinstance(active_mods, (list, tuple)) and len(active_mods) > 1:
+            active_mods = []
+
+        # Normalize to None or list for jaxatari.make
+        if isinstance(active_mods, (list, tuple)) and len(active_mods) == 0:
+            mods_arg = None
+        else:
+            mods_arg = active_mods
+
+        env = jaxatari.make(env_id, mods=mods_arg)
+
+        env = AtariWrapper(
+            env,
+            sticky_actions=0.0,
+            episodic_life=not eval, 
+            first_fire=True,
+            noop_max=30,
+            full_action_space=False,
+        )
+        if pixel_based:
+            env = PixelObsWrapper(
+                env,
+                do_pixel_resize=True,
+                pixel_resize_shape=(84, 84),
+                grayscale=True,
+                use_native_downscaling=native_downscaling,
+                smooth_image=False,
+                frame_stack_size=4,
+                frame_skip=4,
+                max_pooling=True,
+                clip_reward=not eval, # only active during training
+            )
+        else:
+            env = ObjectCentricWrapper(
+                        env,
+                        frame_stack_size=4,
+                        frame_skip=4,
+                        clip_reward=not eval,
+                    )
+            env = FlattenObservationWrapper(
+                NormalizeObservationWrapper(
+                    env,
+                    dtype=jnp.float32,
+                )
+            )
+            if game_rm is not None:
+                rm = RewardMachine(game_rm)
+                env = RewardMachineWrapper(env,rm, use_crm, use_shaping, gamma)
+        env = LogWrapper(env)
+        return env
+    return thunk
+
+class QNetwork(nn.Module):
+    action_dim: int
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray):
+        x = nn.Dense(512, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
+        x = nn.relu(x)
+        x = nn.Dense(512, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
+        x = nn.relu(x)
+        x = nn.Dense(256, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
+        x = nn.relu(x)
+        return nn.Dense(
+            self.action_dim, kernel_init=nn.initializers.orthogonal(0.01)
+        )(x)
+
+class CustomTrainState(TrainState):
+    target_network_params: flax.core.FrozenDict
+    timesteps: int
+    n_updates: int
+
+
+def single_run(config: dict):
+
+    # Keep TARGET_UPDATE_INTERVAL propotional to NUM_ENVS
+    config["NUM_UPDATES"] = int(config["TOTAL_TIMESTEPS"] // config["NUM_ENVS"])
+    config["TARGET_UPDATE_INTERVAL"] = max(1, round(
+        config["TARGET_UPDATE_GRAD_STEPS"] * config["TRAINING_INTERVAL"] / config["GRAD_STEPS_PER_ITER"]
+    ))
+
+    run_name = f'{config["ENV_ID"]}_{config["EXP_NAME"]}_{"oc" if not config["PIXEL_BASED"] else "pixel"}_{config["SEED"]}'
+    wandb.init(
+        project=config["PROJECT"],
+        entity=config["ENTITY"],
+        config=config,
+        name=run_name,
+        save_code=True,
+    )
+
+    # TRY NOT TO MODIFY: seeding
+    random.seed(config["SEED"])
+    np.random.seed(config["SEED"])
+    key = jax.random.PRNGKey(config["SEED"])
+    key, _network_key, _actor_key, _critic_key = jax.random.split(key, 4)
+    # key, obs_sample_key1, obs_sample_key2, obs_sample_key3 = jax.random.split(key, 4)
+
+    # Add Reward Machine
+    rm_name = config.get("GAME_RM", None)
+    game_rm: GameRM | None = GAME_RM_REGISTRY[rm_name]() if rm_name is not None else None
+    use_rm = game_rm is not None
+    use_crm = use_rm & config.get("USE_CRM", False)
+    use_shaping = use_rm & config.get("USE_SHAPING", False)
+    gamma = config.get("GAMMA", 0)
+    num_transitions = len(game_rm.TRANSITIONS) if use_rm else 0
+
+    # env setup
+    env = make_env(
+        config["ENV_ID"],
+        list(config["TRAIN_MODS"]),
+        config["PIXEL_BASED"],
+        config["NATIVE_DOWNSCALING"],
+        False,
+        game_rm,
+        use_crm,
+        use_shaping,
+        gamma
+    )()
+
+    obs_shape = env.observation_space().shape
+
+    @jax.jit
+    def vmap_reset(key):
+        obs, state = jax.vmap(env.reset)(key)
+        return obs.reshape(key.shape[0], *obs_shape), state
+    
+    @jax.jit
+    def vmap_step(state, action):
+        next_obs, state, reward, terminated, truncated, info = jax.vmap(env.step)(state, action)
+        next_done = jnp.logical_or(terminated, truncated)
+        return next_obs.reshape(action.shape[0], *obs_shape), state, reward, next_done, info
+
+    key, _rng = jax.random.split(key)
+    init_obs, env_state = vmap_reset(jax.random.split(_rng, config["NUM_ENVS"]))
+
+
+    #Init Buffer
+    add_batch_size = config["NUM_ENVS"] * (game_rm.num_states() if use_crm else 1)
+    buffer = fbx.make_flat_buffer(
+        max_length=config["BUFFER_SIZE"],
+        min_length=config["BUFFER_BATCH_SIZE"],
+        sample_batch_size=config["BUFFER_BATCH_SIZE"],
+        add_sequences=False,
+        add_batch_size=add_batch_size
+    )
+
+    buffer = buffer.replace(
+        init=jax.jit(buffer.init),
+        add=jax.jit(buffer.add, donate_argnums=0),
+        sample=jax.jit(buffer.sample),
+        can_sample=jax.jit(buffer.can_sample),
+    )
+
+    _dummy_action = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
+
+    def _added_batch(state, last_obs, action):
+        """Mirror of the buffer update in _update_step, for shape inference only."""
+        obs, _s, reward, done, info = vmap_step(state, action)
+        if use_rm:
+            return jax.tree.map(
+                lambda x: x.reshape((-1,) + x.shape[2:]), info["experiences"]
+            )
+        return TimeStep(obs=last_obs, action=action, reward=reward, next_obs=obs, done=done)
+
+    _struct = jax.eval_shape(_added_batch, env_state, init_obs, _dummy_action)
+    _timestep = jax.tree.map(lambda x: jnp.zeros(x.shape[1:], x.dtype), _struct)
+    buffer_state = buffer.init(_timestep)
+
+    # dummy_rng = jax.random.PRNGKey(0)
+    # _action = env.action_space().sample(dummy_rng)
+    # _obs, _env_state = env.reset(dummy_rng)
+    # _obs, _env_state, _reward, _term, _trunc, _info = env.step(_env_state, _action)
+    # _done = jnp.logical_or(_term, _trunc)
+    # _timestep = TimeStep(obs=_obs.squeeze(), action=_action, reward=_reward, next_obs=_obs.squeeze(), done=_done)
+    # buffer_state = buffer.init(_timestep)
+
+    # INIT NETWORK AND OPTIMIZER
+    network = QNetwork(action_dim=env.action_space().n)
+    init_x = jnp.zeros(env.observation_space().shape)
+    key, _rng = jax.random.split(key)
+    network_params = network.init(_rng, init_x)
+
+    warmup_iters = config["LEARNING_STARTS"] // config["NUM_ENVS"]
+    num_grad_updates = max(
+        1, (config["NUM_UPDATES"] - warmup_iters) // config["TRAINING_INTERVAL"]
+    )
+
+    def linear_schedule(count):
+        frac = 1.0 - (count / num_grad_updates)
+        return config["LR"] * frac
+
+    lr = linear_schedule if config.get("LR_LINEAR_DECAY", False) else config["LR"]
+    tx = optax.chain(optax.clip_by_global_norm(10.0), optax.adam(learning_rate=lr))
+
+    train_state = CustomTrainState.create(
+        apply_fn=network.apply,
+        params=network_params,
+        target_network_params=jax.tree_util.tree_map(jnp.copy, network_params),
+        tx=tx,
+        timesteps=0,
+        n_updates=0,
+    )
+
+    # epsilon-greedy exploration
+    def eps_greedy_exploration(rng, q_vals, t):
+        rng_a, rng_e = jax.random.split(
+            rng, 2
+        )  # a key for sampling random actions and one for picking
+        eps = jnp.clip(  # get epsilon
+            (
+                (config["EPSILON_FINISH"] - config["EPSILON_START"])
+                / config["EPSILON_ANNEAL_TIME"]
+            )
+            * t
+            + config["EPSILON_START"],
+            config["EPSILON_FINISH"],
+        )
+        greedy_actions = jnp.argmax(q_vals, axis=-1)  # get the greedy actions
+        chosed_actions = jnp.where(
+            jax.random.uniform(rng_e, greedy_actions.shape) < eps,  # pick the actions that should be random
+            jax.random.randint(
+                rng_a, shape=greedy_actions.shape, minval=0, maxval=q_vals.shape[-1]
+            ),  # sample random actions,
+            greedy_actions,
+        )
+        return chosed_actions
+
+    # TRAINING LOOP
+    def _update_step(runner_state, unused):
+
+        train_state, buffer_state, env_state, last_obs, rng = runner_state
+
+        # STEP THE ENV
+        rng, rng_a, rng_s = jax.random.split(rng, 3)
+        q_vals = network.apply(train_state.params, last_obs)
+        action = eps_greedy_exploration(
+            rng_a, q_vals, train_state.timesteps
+        )  # explore with epsilon greedy_exploration
+
+        obs, env_state, reward, done, info = vmap_step(env_state, action)
+
+        train_state = train_state.replace(
+            timesteps=train_state.timesteps + config["NUM_ENVS"]
+        )  # update timesteps count
+
+        # BUFFER UPDATE
+        if use_rm:
+            to_add = jax.tree.map(
+                lambda x: x.reshape((-1,) + x.shape[2:]), info["experiences"]
+            )
+        else:
+            to_add = TimeStep(
+                obs=last_obs, action=action, reward=reward, next_obs=obs, done=done
+            )
+        buffer_state = buffer.add(buffer_state, to_add)
+
+        # NETWORKS UPDATE
+        def _learn_phase(train_state, rng):
+
+            learn_batch = buffer.sample(buffer_state, rng).experience.first
+
+            # q_next_target = network.apply(
+            #     train_state.target_network_params, learn_batch.second.obs
+            # )  # (batch_size, num_actions)
+            # q_next_target = jnp.max(q_next_target, axis=-1)  # (batch_size,)
+            q_next_online = network.apply(train_state.params, learn_batch.next_obs)
+            next_actions = jnp.argmax(q_next_online, axis=-1)
+
+            q_next_target = network.apply(train_state.target_network_params, learn_batch.next_obs)
+            q_next_target = jnp.take_along_axis(q_next_target, next_actions[:, None], axis=-1).squeeze(-1)
+
+            target = (
+                learn_batch.reward
+                + (1 - learn_batch.done) * config["GAMMA"] * q_next_target
+            )
+
+            def _loss_fn(params):
+                q_vals = network.apply(params, learn_batch.obs)
+                chosen = jnp.take_along_axis(q_vals, learn_batch.action[:, None], axis=-1).squeeze(-1)
+                return jnp.mean(optax.huber_loss(chosen, target, delta=1.0))
+
+            loss, grads = jax.value_and_grad(_loss_fn)(train_state.params)
+            train_state = train_state.apply_gradients(grads=grads)
+            train_state = train_state.replace(n_updates=train_state.n_updates + 1)
+            return train_state, loss
+
+        def _learn_k_steps(train_state, rng):
+            def _grad_step(carry, _):
+                train_state, rng = carry
+                rng, step_rng = jax.random.split(rng)
+                train_state, loss = _learn_phase(train_state, step_rng)
+                return (train_state, rng), loss
+
+            (train_state, _), losses = jax.lax.scan(
+                _grad_step, (train_state, rng), None, config["GRAD_STEPS_PER_ITER"]
+            )
+            return train_state, losses.mean()
+
+        rng, _rng = jax.random.split(rng)
+        env_iters = train_state.timesteps // config["NUM_ENVS"]
+        is_learn_time = (
+            (buffer.can_sample(buffer_state))
+            & (  # enough experience in buffer
+                train_state.timesteps > config["LEARNING_STARTS"]
+            )
+            & (  # pure exploration phase ended
+                env_iters % config["TRAINING_INTERVAL"] == 0
+            )  # training interval
+        )
+        train_state, loss = jax.lax.cond(
+            is_learn_time,
+            lambda train_state, rng: _learn_k_steps(train_state, rng),
+            lambda train_state, rng: (train_state, jnp.array(0.0)),  # do nothing
+            train_state,
+            _rng,
+        )
+
+        # Target update: either hard (TAU=1.0 with an interval) or soft
+        # (TAU~0.005 with interval 1). Combining a small TAU with a large
+        # interval multiplies both delays and freezes the target network.
+        train_state = jax.lax.cond(
+            env_iters % config["TARGET_UPDATE_INTERVAL"] == 0,
+            lambda train_state: train_state.replace(
+                target_network_params=optax.incremental_update(
+                    train_state.params,
+                    train_state.target_network_params,
+                    config["TAU"],
+                )
+            ),
+            lambda train_state: train_state,
+            operand=train_state,
+        )
+
+        metrics = {
+            "timesteps": train_state.timesteps,
+            "updates": train_state.n_updates,
+            "loss": loss.mean(),
+            "returns_sum": jnp.sum(info["returned_episode_returns"] * info["returned_episode"]),
+            "returns_count": jnp.sum(info["returned_episode"]),
+            "env_reward": info["env_reward"].mean(),
+        }
+        if use_rm:
+            fired = info["rm_fired_idx"]
+            metrics["rm_reward"] = info["rm_reward"].mean()
+            metrics["shaping"] = info["shaping"].mean()
+            metrics["fired_hist"] = jnp.sum(
+                jax.nn.one_hot(fired, num_transitions), axis=0
+            )
+
+        runner_state = (train_state, buffer_state, env_state, obs, rng)
+        return runner_state, metrics
+
+    def save_model(params, step):
+        """Write a checkpoint. No-op when SAVE_PATH is not configured."""
+        if config.get("SAVE_PATH") is None:
+            return
+        model_path = f'{config["SAVE_PATH"]}/{run_name}/step_{step}.cleanrl_model'
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        with open(model_path, "wb") as f:
+            f.write(flax.serialization.to_bytes([config, params]))
+        print(f"model saved to {model_path}")
+
+    def eval_model(params, step):
+        """Evaluate on the base game and on each mod separately."""
+        eval_mods = config["EVAL_MODS"] or config["TRAIN_MODS"]
+        eval_configs = [([], "default")] + [([mod], mod) for mod in eval_mods]
+
+        metrics = {}
+        for mods_config, mod_label in eval_configs:
+            print(f"Evaluating on {mod_label} ...")
+            episodic_returns, env_states = evaluate_dqn(
+                params,
+                partial(
+                    make_env,
+                    mods=mods_config,
+                    pixel_based=config["PIXEL_BASED"],
+                    native_downscaling=config["NATIVE_DOWNSCALING"],
+                    eval=True,
+                    game_rm=game_rm,
+                ),
+                config["ENV_ID"],
+                eval_episodes=10,
+                QNetwork=QNetwork,
+                seed=config["SEED"],
+                use_rm=use_rm,
+            )
+            returns_np = jax.device_get(episodic_returns)
+            mean_ret = float(np.mean(returns_np))
+            metrics[mod_label] = mean_ret
+
+            log = {
+                f"eval/episodic_return_{mod_label}": mean_ret,
+                f"eval/episodic_return_{mod_label}_std": float(np.std(returns_np)),
+                f"eval/episodic_return_{mod_label}_min": float(np.min(returns_np)),
+                f"eval/episodic_return_{mod_label}_max": float(np.max(returns_np)),
+            }
+            if config.get("CAPTURE_VIDEO", False):
+                renderer = jaxatari.make(config["ENV_ID"], mods=mods_config).renderer
+                frames = jnp.transpose(jax.vmap(renderer.render)(env_states), (0, 3, 1, 2))
+                log[f"eval/video_{mod_label}"] = wandb.Video(
+                    np.array(frames), fps=30, format="mp4"
+                )
+                print(f"Video (eval) logged with {frames.shape[0]} frames.")
+            wandb.log(log, step=step)
+        return metrics
+
+    # --- CHUNKED TRAINING LOOP (replaces the single big scan) ---
+    updates_per_eval = max(1, config["EVAL_EVERY"] // config["NUM_ENVS"])
+    num_chunks = config["NUM_UPDATES"] // updates_per_eval
+
+    assert num_chunks > 0, (
+        f"num_chunks=0: EVAL_EVERY={config['EVAL_EVERY']} zu groß relativ zu "
+        f"NUM_UPDATES={config['NUM_UPDATES']} (NUM_ENVS={config['NUM_ENVS']})"
+    )
+
+    @partial(jax.jit, donate_argnums=(0,))
+    def train_chunk(runner_state):
+        return jax.lax.scan(_update_step, runner_state, None, updates_per_eval)
+
+    key, _rng = jax.random.split(key)
+    runner_state = (train_state, buffer_state, env_state, init_obs, _rng)
+
+    start_time = time.time()
+    eval_metrics = {}
+    episode_returns = []
+
+    for chunk in range(1, num_chunks + 1):
+        runner_state, chunk_metrics = train_chunk(runner_state)
+        train_state = runner_state[0]
+        global_step = int(train_state.timesteps)
+        elapsed = time.time() - start_time
+
+        log = {
+            "charts/env_reward_per_step": float(chunk_metrics["env_reward"].mean()),
+            "losses/td_loss": float(chunk_metrics["loss"].mean()),
+            "charts/SPS": int(global_step / elapsed),
+            "charts/time": elapsed,
+        }
+        count = float(chunk_metrics["returns_count"].sum())
+        if count > 0:
+            avg_return = float(chunk_metrics["returns_sum"].sum()) / count
+            log["charts/avg_episodic_return"] = avg_return
+            episode_returns.append(avg_return)
+
+        if use_rm:
+            log["charts/rm_reward_per_step"] = float(chunk_metrics["rm_reward"].mean())
+            hist = np.asarray(chunk_metrics["fired_hist"].sum(axis=0))
+            log.update({f"transitions/t{i}": float(hist[i]) for i in range(num_transitions)})
+        wandb.log(log, step=global_step)
+
+        if config["EVAL_DURING_TRAIN"]:
+            eval_metrics = eval_model(train_state.params, global_step)
+
+    print(f"Total train time: {(time.time() - start_time) / 60:.2f} minutes.")
+    final_step = int(train_state.timesteps)
+    save_model(train_state.params, final_step)
+    eval_metrics = eval_model(train_state.params, final_step)
+    if episode_returns:
+        n_last = max(1, len(episode_returns) // 5)  # last ~20% of training
+        wandb.run.summary["final/return_last_20pct"] = float(np.mean(episode_returns[-n_last:]))
+        wandb.run.summary["final/return_mean_all"] = float(np.mean(episode_returns))
+    wandb.finish()
+
+    return eval_metrics

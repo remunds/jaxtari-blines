@@ -1,0 +1,34 @@
+ALG: HRM
+EXP_NAME: double_dqn_hrm 
+PIXEL_BASED: False          # HRM needs symbolic events; asserted in hrm.py
+NATIVE_DOWNSCALING: True    # unused when PIXEL_BASED is False, kept for schema parity
+TOTAL_TIMESTEPS: 9_932_800
+NUM_ENVS: 2048
+GAMMA: 0.99
+USE_SHAPING: False          # affects the meta return only; options always use
+                            # binary pseudo-rewards
+LEARNING_STARTS: 20_000
+TRAINING_INTERVAL: 1
+GRAD_STEPS_PER_ITER: 64
+TARGET_UPDATE_GRAD_STEPS: 375
+TAU: 1.0
+
+# --- option level ---
+LR: 2.5e-4
+LR_LINEAR_DECAY: False
+BUFFER_SIZE: 500_000
+BUFFER_BATCH_SIZE: 512
+EPSILON_START: 1.0
+EPSILON_FINISH: 0.02
+EPSILON_ANNEAL_TIME: 3_000_000
+
+# --- meta level  ---
+META_LR: 1.0e-4
+META_BUFFER_SIZE: 100_000
+META_BATCH_SIZE: 64
+META_EPSILON_START: 1.0
+META_EPSILON_FINISH: 0.1
+META_EPSILON_ANNEAL_TIME: 200_000
+
+# --- options ---
+OPTION_MAX_STEPS: 200

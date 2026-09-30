@@ -18,15 +18,19 @@ import jaxatari
 from jaxatari.wrappers import NormalizeObservationWrapper, ObjectCentricWrapper, PixelObsWrapper, AtariWrapper, LogWrapper, FlattenObservationWrapper
 from jaxatari import spaces
 from agents.ppo.ppo_eval import evaluate
-
 from rtpt import RTPT
+from reward_machines.games.game_rm import GameRM
+from reward_machines.reward_machine import RewardMachine
+from reward_machines.reward_machine_wrapper import RewardMachineWrapper
+from reward_machines.rm_registry import GAME_RM_REGISTRY
 
-def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False):
+def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False, game_rm: GameRM | None=None):
     assert mods is None or isinstance(mods, list), "mods must be None or a list of strings"
     if mods is not None and len(mods) == 0:
         mods = None
     if not eval and mods is not None and len(mods) > 0:
         print(f"[WARNING] Training on mods {mods}!")
+
 
     def thunk():
         env = jaxatari.make(env_id, mods=mods)
@@ -52,16 +56,20 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
                 clip_reward=not eval,
             )
         else:
-            env = FlattenObservationWrapper(
-                NormalizeObservationWrapper(
-                    ObjectCentricWrapper(
+            env = ObjectCentricWrapper(
                         env,
                         frame_stack_size=4,
                         frame_skip=4,
                         clip_reward=not eval,
                     )
+            env = FlattenObservationWrapper(
+                NormalizeObservationWrapper(
+                    env
                 )
             )
+            if game_rm is not None:
+                rm = RewardMachine(game_rm)
+                env = RewardMachineWrapper(env, rm)
         env = LogWrapper(env)
         return env
     return thunk
@@ -183,8 +191,13 @@ def single_run(config: dict):
     key, network_key, actor_key, critic_key = jax.random.split(key, 4)
     key, obs_sample_key1, obs_sample_key2, obs_sample_key3 = jax.random.split(key, 4)
 
+    # Add Reward Machine
+    rm_name = config.get("GAME_RM", None)
+    game_rm = GAME_RM_REGISTRY[rm_name]() if rm_name is not None else None
+    use_rm = game_rm != None
+
     # env setup
-    env = make_env(config["ENV_ID"], list(config["TRAIN_MODS"]), config["PIXEL_BASED"], config["NATIVE_DOWNSCALING"], False)()
+    env = make_env(config["ENV_ID"], list(config["TRAIN_MODS"]), config["PIXEL_BASED"], config["NATIVE_DOWNSCALING"], False, game_rm)()
    
     # vmap and squeeze observations in order to get (B, F, H, W, 1) -> (B, F, H, W),
     # where F is the frame stack which becomes the channel for the convolutions
@@ -399,6 +412,7 @@ def single_run(config: dict):
                 eval_configs.append((mods_config, mod_label))
 
         metrics = {}
+
         for mods_config, mod_label in eval_configs:
             print(f"Evaluating on {mod_label} ...")
             episodic_returns, env_states = evaluate(
@@ -409,11 +423,13 @@ def single_run(config: dict):
                     pixel_based=config["PIXEL_BASED"],
                     native_downscaling=config["NATIVE_DOWNSCALING"],
                     eval=True,
+                    game_rm=game_rm
                 ),
                 config["ENV_ID"],
                 eval_episodes=10,
                 Model=(Network, Actor, Critic) if config["PIXEL_BASED"] else (MLP_Network, Actor, Critic),
                 seed=config["SEED"]+42, # use a different seed for evaluation 
+                use_rm=use_rm
             )
             # wandb.log({f"eval/episodic_return_{mod_label}": np.mean(jax.device_get(episodic_returns)), "step": iteration})
             metrics[mod_label] = np.mean(jax.device_get(episodic_returns))

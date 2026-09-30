@@ -1,6 +1,8 @@
 import hydra
 from omegaconf import OmegaConf
 
+OmegaConf.register_new_resolver("eval", eval, replace=True)
+
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
     config = OmegaConf.to_container(config, resolve=True)
@@ -22,6 +24,9 @@ def main(config):
             run_fn = single_run
         elif merged_config["ALG"] == "C51":
             from agents.c51.c51 import single_run
+            run_fn = single_run
+        elif merged_config["ALG"] == "DREAMER":
+            from agents.dreamer import single_run
             run_fn = single_run
 
         used_seed = starting_seed + seed

@@ -1,0 +1,40 @@
+ALG: LEWM
+EXP_NAME: lewm
+
+PIXEL_BASED: True
+NATIVE_DOWNSCALING: True
+
+# Which trunk the PPO agent learns on:
+#   lewm_frozen   pretrained LeWM encoder, frozen (the reported configuration)
+#   lewm_finetune same encoder, unfrozen at a reduced learning rate
+#   scratch       control; skips world-model training entirely
+FEATURES: lewm_frozen
+
+# --- world model (reward-free pretraining) ---
+WM_TOTAL_STEPS: 5000
+WM_SEQ_LEN: 16
+WM_BATCH_SIZE: 32
+WM_LR: 3e-4
+WM_SIGREG_WEIGHT: 0.1     # lambda; 0 removes the anti-collapse term and it collapses
+WM_INIT_SEQUENCES: 600
+WM_COLLECT_EVERY: 50
+WM_COLLECT_N: 20
+WM_EVAL_SEQ: 64
+WM_ACTION_COND: adaln     # "add" is the ablation
+WM_MAX_EPISODE_STEPS: 500
+
+# --- PPO on the learned representation ---
+TOTAL_TIMESTEPS: 1e6
+LEARNING_RATE: 2.5e-4
+NUM_ENVS: 8
+NUM_STEPS: 128
+ANNEAL_LR: True
+GAMMA: 0.99
+GAE_LAMBDA: 0.95
+NUM_MINIBATCHES: 4
+UPDATE_EPOCHS: 4
+NORM_ADV: True
+CLIP_COEF: 0.1
+ENT_COEF: 0.01
+VF_COEF: 0.5
+MAX_GRAD_NORM: 0.5

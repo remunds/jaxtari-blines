@@ -11,6 +11,9 @@ dependencies = [
     "hydra-core>=1.3.2",
     "jax[cuda12]", # use "jax" if no cuda available
     "flashbax",
+    # LeWM keeps the env in JAX but writes its networks in torch; see agents/lewm/README.md
+    "torch",
+    "einops",
 ]
 
 [tool.uv]

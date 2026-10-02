@@ -1,0 +1,28 @@
+ALG: IQN
+EXP_NAME: iqn
+
+PIXEL_BASED: False
+NATIVE_DOWNSCALING: True
+
+TOTAL_TIMESTEPS: 10000000
+BUFFER_SIZE: 1000000 # OC observations are small, so the full CleanRL-size buffer fits
+LEARNING_STARTS: 80000
+TARGET_NETWORK_FREQUENCY: 10000
+SCAN_STEPS: 1000
+GRADIENT_STEPS: 4 # per iteration n_envs*train_freq=128 transitions are collected; 4 updates x batch 256 == CleanRL data budget (-1 == n_envs*train_freq == 128)
+
+NUM_ENVS: 32
+LEARNING_RATE: 2.5e-4 # 5e-5 (IQN reference) learns too slowly on OC: Pong reached eval ~15 at 10M; 2.5e-4 (as C51 OC) reaches ~20
+BATCH_SIZE: 256
+TRAIN_FREQUENCY: 4
+GAMMA: 0.99
+TAU: 1.0
+START_E: 1.0
+END_E: 0.01
+EXPLORATION_FRACTION: 0.10
+
+N_TAU: 64
+N_TAU_PRIME: 64
+N_TAU_K: 32
+N_COS: 64
+KAPPA: 1.0

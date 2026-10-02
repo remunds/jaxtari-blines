@@ -12,16 +12,24 @@ def main(config):
     starting_seed = merged_config.get("SEED", 0)
     for seed in range(n_seeds):
         if merged_config["ALG"] == "PPO":
+            
             from agents.ppo.ppo import single_run
             run_fn = single_run
+
         elif merged_config["ALG"] == "DQN":  
             from agents.dqn.dqn import single_run  
             run_fn = single_run
+
         elif merged_config["ALG"] == "RAINBOW":  
-            from agents.rainbow.rainbow import single_run  
+            from agents.rainbow.rainbow import single_run 
+
             run_fn = single_run
         elif merged_config["ALG"] == "C51":
             from agents.c51.c51 import single_run
+            run_fn = single_run
+         
+        elif merged_config["ALG"] == "IQN":
+            from agents.iqn.iqn import single_run
             run_fn = single_run
 
         used_seed = starting_seed + seed

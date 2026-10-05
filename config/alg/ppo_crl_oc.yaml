@@ -1,4 +1,6 @@
+ALG: PPO_CRL
 EXP_NAME: seaquest3
+
 TRACK: True
 CAPTURE_VIDEO: False
 VIDEO_AT_END: True  # True: capture videos only at the end of training on a task
@@ -11,39 +13,11 @@ PIXEL_BASED: False
 NATIVE_DOWNSCALING: True
 PIXEL_RESIZE_SHAPE: [84, 84]
 SMOOTH_IMAGE: False
-
 FRAME_STACK: 4
 
 SAVE_MODEL: False
 UPLOAD_MODEL: False
 HF_ENTITY: ""
-
-TASKS: [seaquest, seaquest, seaquest] # replaces ENV_ID
-TIMESTEPS_PER_TASK: 10000000  # replaces TOTAL_TIMESTEPS
-
-# mods applied during training, for each environment
-TRAIN_MODS: 
-  - []
-  - [unlimited_oxygen]
-  - [no_divers]
-# sets of mods applied during evaluation, for each environment
-EVAL_MODS: 
-  - [ [] ]
-  - [ [unlimited_oxygen] ]
-  - [ [no_divers] ]
-
-CL_METHOD: ewc  # ewc, agem, packnet
-
-# EWC
-EWC_DECAY: 0.9  # Decay for Online EWC
-EWC_LAMBDA: 1000000.0  # Weight for EWC penalty
-
-# AGEM
-SAMPLES_PER_TASK: 256  # Samples to store in the memory buffer per task
-AGEM_MINIBATCH_SIZE: 256
-
-# PackNet
-PRUNE_ITERATION_FRAC: 0.66  # Percentage of training at which the PackNet pruning is performed
 
 LEARNING_RATE: 0.00025
 NUM_ENVS: 512
@@ -60,3 +34,35 @@ ENT_COEF: 0.01
 VF_COEF: 0.5
 MAX_GRAD_NORM: 0.5
 TARGET_KL: null
+
+# =================================================================
+# CL Specific Configs
+# =================================================================
+
+TASKS: [pong, pong, pong] # replaces ENV_ID
+TIMESTEPS_PER_TASK: 1000000  # replaces TOTAL_TIMESTEPS
+
+# mods applied during training, for each environment
+TRAIN_MODS: 
+  - []
+  - [lazy_enemy]
+  - [shift_player]
+
+# sets of mods applied during evaluation, for each environment
+EVAL_MODS: 
+  - [ [] ]
+  - [ [lazy_enemy] ]
+  - [ [shift_player] ]
+
+CL_METHOD: agem  # ewc, agem, packnet
+
+# EWC
+EWC_DECAY: 0.9  # Decay for Online EWC
+EWC_LAMBDA: 1000000.0  # Weight for EWC penalty
+
+# AGEM
+SAMPLES_PER_TASK: 256  # Samples to store in the memory buffer per task
+AGEM_MINIBATCH_SIZE: 256
+
+# PackNet
+PRUNE_ITERATION_FRAC: 0.66  # Percentage of training at which the PackNet pruning is performed

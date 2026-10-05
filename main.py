@@ -23,6 +23,9 @@ def main(config):
         elif merged_config["ALG"] == "C51":
             from agents.c51.c51 import single_run
             run_fn = single_run
+        elif merged_config["ALG"] == "PPO_CRL":
+            from agents.ppo_crl.ppo_crl_scan import continual_run
+            run_fn = continual_run
 
         used_seed = starting_seed + seed
         print(f"Running seed {used_seed} ...")

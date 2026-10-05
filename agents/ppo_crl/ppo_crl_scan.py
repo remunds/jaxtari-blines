@@ -1130,7 +1130,7 @@ def continual_run(config: dict):
         "a_j_j": {},
     }
 
-    rtpt = RTPT(name_initials='TR', experiment_name='PPOEWC_JAXAtari', max_iterations=config["NUM_ITERATIONS"]*len(config["TASKS"]))
+    rtpt = RTPT(name_initials=config["NAME_INITIALS"], experiment_name='PPOEWC_JAXAtari', max_iterations=config["NUM_ITERATIONS"]*len(config["TASKS"]))
     rtpt.start()
 
     for i, task_id in enumerate(config["TASKS"]):
@@ -1168,12 +1168,4 @@ def continual_run(config: dict):
 
     wandb.finish()
 
-@hydra.main(version_base=None, config_path="./config", config_name="config")
-def main(config):
-    config = OmegaConf.to_container(config, resolve=True)
-    merged_config = {**config, **config.get("alg", {})}
-    print("Config:\n", OmegaConf.to_yaml(OmegaConf.create(config)))
-    continual_run(merged_config)
-
-if __name__ == "__main__":
-    main()
+    return crl_state["a_j_j"]

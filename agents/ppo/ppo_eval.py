@@ -5,8 +5,8 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
-from jaxatari.environment import JaxEnvironment
-from jaxatari.wrappers import JaxatariWrapper
+from jaxtari.environment import JaxEnvironment
+from jaxtari.wrappers import JaxtariWrapper
 
 def evaluate(
     model_path: str,
@@ -16,7 +16,7 @@ def evaluate(
     Model: nn.Module,
     seed=1,
 ):
-    env: JaxEnvironment | JaxatariWrapper = make_env(env_id)()
+    env: JaxEnvironment | JaxtariWrapper = make_env(env_id)()
     _Network, _Actor, _Critic = Model
     key = jax.random.key(seed)
 

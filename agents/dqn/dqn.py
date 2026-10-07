@@ -14,8 +14,8 @@ import flashbax as fbx
 import wandb
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
-import jaxatari
-from jaxatari.wrappers import (
+import jaxtari
+from jaxtari.wrappers import (
     NormalizeObservationWrapper,
     ObjectCentricWrapper,
     PixelObsWrapper,
@@ -36,7 +36,7 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
         print(f"[WARNING] Training on mods {mods}!")
 
     def thunk():
-        env = jaxatari.make(env_id, mods=mods)
+        env = jaxtari.make(env_id, mods=mods)
         env = AtariWrapper(
             env,
             sticky_actions=0.0,
@@ -352,7 +352,7 @@ def single_run(config: dict):
 
             if config["CAPTURE_VIDEO"]: 
                 # Instantiate a clean renderer immune to the training env's downscaling
-                clean_renderer = jaxatari.make(config["ENV_ID"], mods=mods_cfg).renderer
+                clean_renderer = jaxtari.make(config["ENV_ID"], mods=mods_cfg).renderer
                 frames = jax.vmap(clean_renderer.render)(env_states)
                 # shape: (N, H, W, C) -> (N, C, H, W)
                 frames = jnp.transpose(frames, (0, 3, 1, 2))

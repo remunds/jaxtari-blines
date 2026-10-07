@@ -5,8 +5,8 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
-from jaxatari.environment import JaxEnvironment
-from jaxatari.wrappers import JaxatariWrapper
+from jaxtari.environment import JaxEnvironment
+from jaxtari.wrappers import JaxtariWrapper
 
 
 def evaluate(
@@ -21,7 +21,7 @@ def evaluate(
     epsilon: float = 0.0,
     seed: int = 1,
 ):
-    env: JaxEnvironment | JaxatariWrapper = make_env(env_id)()
+    env: JaxEnvironment | JaxtariWrapper = make_env(env_id)()
     atoms = jnp.linspace(v_min, v_max, n_atoms)
     key = jax.random.PRNGKey(seed)
 

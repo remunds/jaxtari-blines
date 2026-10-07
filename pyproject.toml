@@ -5,7 +5,7 @@ description = "Simple jax-based baseline implementations for efficient evaluatio
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "jaxatari @ git+https://github.com/k4ntz/JAXAtari.git",
+    "jaxtari @ git+https://github.com/k4ntz/JAXAtari.git@dev",
     "rtpt>=0.0.4",
     "wandb[media]>=0.27.0",
     "hydra-core>=1.3.2",

@@ -1,0 +1,167 @@
+ALG: "DREAMER"
+ENV_ID: "Pong"
+PIXEL_BASED: True
+replay_buffer:
+  buffer_size: 1e5
+  batch_size: 8
+  batch_length: 64
+
+rssm:
+  hidden_dim: 256
+  latent_classes: 32
+  latent_categoricals: 32
+  memory_dim: ${eval:8*${alg.rssm.hidden_dim}}
+  state_dim: ${eval:${alg.rssm.memory_dim}+${alg.rssm.latent_classes}*${alg.rssm.latent_categoricals}}
+  n_actions: ${alg.params.n_actions}
+  pixels: true
+  n_bins: ${alg.params.n_bins}
+  
+  obs_embed:
+    type: mlp
+    hidden_dims: ["${alg.rssm.hidden_dim}", "${alg.rssm.hidden_dim}"]
+    activation: silu
+    normalize: rms
+    outact: none
+    output_dim: ${alg.rssm.hidden_dim}
+  decoder:
+    type: 'mlp'
+    hidden_dims: ["${alg.rssm.hidden_dim}", "${alg.rssm.hidden_dim}"]
+    activation: silu
+    normalize: rms
+    outact: none
+    input_dim: ${alg.rssm.state_dim}
+
+  obs_embed_pixel:
+    type: residual_encoder
+    mlp_layers: [256, 256, "${alg.rssm.hidden_dim}"]
+    depth: 24
+    mlp_activation: silu
+    cnn_activation: silu
+    min_resolution: 4
+    cnn_blocks: 2
+    output_dim: ${alg.rssm.hidden_dim}
+  decoder_pixel:
+    type: residual_decoder
+    mlp_layers: ["${alg.rssm.state_dim}", 256, 256]
+    depth: 24
+    mlp_activation: silu
+    cnn_activation: silu
+    min_resolution: 4
+    cnn_blocks: 2
+  
+  encoder:
+    type: mlp
+    hidden_dims: ["${alg.rssm.hidden_dim}"]
+    activation: silu
+    normalize: rms
+    outact: none
+    input_dim: ${eval:${alg.rssm.memory_dim}+${alg.rssm.hidden_dim}}
+    output_dim: ${eval:${alg.rssm.latent_classes}*${alg.rssm.latent_categoricals}}
+
+  embed:
+    type: mlp
+    hidden_dims: ["${alg.rssm.hidden_dim}"]
+    output_dim: ${alg.rssm.hidden_dim}
+    activation: silu
+    normalize : rms
+    outact: none
+  
+  rnn:
+    type: blockgru
+    groups: 8
+    input_dim: ${eval:3*${alg.rssm.hidden_dim}}
+    hidden_dim: ${alg.rssm.memory_dim}
+  
+  dynamics:
+    type: mlp
+    hidden_dims: ["${alg.rssm.hidden_dim}", "${alg.rssm.hidden_dim}"]
+    activation: silu
+    normalize: rms
+    outact: none
+    input_dim: ${alg.rssm.memory_dim}
+    output_dim: ${eval:${alg.rssm.latent_classes}*${alg.rssm.latent_categoricals}}
+
+  reward:
+    type: mlp
+    hidden_dims: ["${alg.rssm.hidden_dim}"]
+    input_dim: ${alg.rssm.state_dim}
+    output_dim: ${alg.rssm.n_bins}
+    activation: silu
+    normalize : rms
+    outact: none
+    zero_out_init : true
+
+  cont:
+    type: mlp
+    hidden_dims: ["${alg.rssm.hidden_dim}"]
+    input_dim: ${alg.rssm.state_dim}
+    output_dim: 1
+    activation: silu
+    normalize : rms
+    outact: none
+  
+actor_critic:
+  hidden_dim: ${alg.rssm.hidden_dim}
+  state_dim: ${alg.rssm.state_dim}
+  n_actions: ${alg.rssm.n_actions}
+  n_bins: ${alg.params.n_bins}
+  v_min: ${alg.params.v_min}
+  v_max: ${alg.params.v_max}
+
+  actor:
+    type: mlp
+    hidden_dims: ["${alg.actor_critic.hidden_dim}", "${alg.actor_critic.hidden_dim}", "${alg.actor_critic.hidden_dim}"]
+    input_dim: ${alg.actor_critic.state_dim}
+    output_dim: ${alg.actor_critic.n_actions}
+    activation: silu
+    normalize : rms
+    outact: none
+  critic:
+    type: mlp
+    hidden_dims: ["${alg.actor_critic.hidden_dim}", "${alg.actor_critic.hidden_dim}", "${alg.actor_critic.hidden_dim}"]
+    output_dim: ${alg.actor_critic.n_bins}
+    input_dim: ${alg.actor_critic.state_dim}
+    activation: silu
+    normalize : rms
+    outact: none
+    zero_out_init : true
+
+seed: 0
+eval_every: 10000
+eval_n_episodes: 10
+eval_max_length: 10000
+timesteps:  1e7
+n_envs: 8
+outdir: rl_experiments/
+exp_id: dreamerv3
+
+params:
+  action_repeat: 4
+  n_actions: 18
+  rollout_length: 1
+  replay_ratio: 32
+  v_min: -20
+  v_max: 20
+  n_bins: 255
+  lambd: 0.95
+  gamma: 0.997
+  entropy_reg: 3e-4
+  lr: 4e-5
+  warmup: 1000 # updates
+  imagination_horizon: 15
+  grad_clip: 0.3
+  unimix : 0.01
+  free_nats: 1.
+  rep_loss_const: 0.1
+  reconst_loss_const: 1.
+  dynamics_loss_const: 1.
+  critic_loss_const: 1.
+  critic_replay_loss_const: 0.3
+  critic_ema_reg: 1.
+  critic_ema_tau: 0.02
+  actor_loss_scale: 1.
+  actor_entropy_reg: 3e-4
+  actor_perc_low : 5
+  actor_perc_high: 95
+  actor_ret_limit: 1.
+  actor_ret_decay: 0.01

@@ -421,7 +421,7 @@ wheels = [
 
 [[package]]
 name = "flashbax"
-version = "0.1.3"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "chex" },
@@ -432,9 +432,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6d/a2/fddfe1f119b964b45d1e9ac557d3e921f393e4369417d0a98803163c705b/flashbax-0.1.3.tar.gz", hash = "sha256:3792972973169d455188451dd3f93a0ab37004bb122bb256a323927daaca9a3e", size = 56444, upload-time = "2025-03-27T09:50:45.513Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/21/6f/a8444ec7ec8a13e192b7c3bab50269158a030b918afdb54c39f73ca44440/flashbax-0.1.1.tar.gz", hash = "sha256:ed35d67e25c51f2b9e8b06b3f14eb57d16add55743e356680bcb48fc8148e3d6", size = 51588, upload-time = "2024-03-12T08:01:15.924Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/80/f2/3ec1ebf403bd1593c44a0e42dbd0935a03bffb090259a3e88699d210a9f0/flashbax-0.1.3-py3-none-any.whl", hash = "sha256:798b0056dd0f525269ad9689a402dd0a515db7cb6976c761aa95004ff37e9697", size = 82386, upload-time = "2025-03-27T09:50:44.004Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/d7/24e2218a5e905713b21657846dc8fddfad278952f6290c217d2a4101f6b9/flashbax-0.1.1-py3-none-any.whl", hash = "sha256:ce375471ea09a8418fcdfc1bd5c580fc6f133c3441e63450dcf3861c541e31da", size = 72958, upload-time = "2024-03-12T08:01:14.075Z" },
 ]
 
 [[package]]
@@ -767,7 +767,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "flashbax" },
+    { name = "flashbax", specifier = "<0.1.2" },
     { name = "hydra-core", specifier = ">=1.3.2" },
     { name = "jax", extras = ["cuda12"] },
     { name = "jaxtari", git = "https://github.com/k4ntz/JAXAtari.git?rev=dev" },

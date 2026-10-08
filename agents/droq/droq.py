@@ -14,18 +14,19 @@ import flashbax as fbx
 import wandb
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
-import jaxatari
-from jaxatari.wrappers import (
+from rtpt import RTPT
+
+import jaxtari
+from jaxtari.wrappers import (
+    AtariWrapper,
+    FlattenObservationWrapper,
+    LogWrapper,
     NormalizeObservationWrapper,
     ObjectCentricWrapper,
     PixelObsWrapper,
-    AtariWrapper,
-    LogWrapper,
-    FlattenObservationWrapper,
-    LogWrapper
 )
 from agents.droq.droq_eval import evaluate
-from rtpt import RTPT
+from agents.run_utils import eval_mod_configs, plan_chunks
 
 
 def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False):
@@ -36,7 +37,7 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
         print(f"[WARNING] Training on mods {mods}!")
 
     def thunk():
-        env = jaxatari.make(env_id, mods=mods)
+        env = jaxtari.make(env_id, mods=mods)
         env = AtariWrapper(
             env,
             sticky_actions=0.0,
@@ -91,7 +92,7 @@ class Actor(nn.Module):
         x = nn.Dense(512)(x)
         x = nn.relu(x)
         x = nn.Dense(self.action_dim)(x)
-        return x  
+        return x
 
 
 class MLPActor(nn.Module):
@@ -104,7 +105,7 @@ class MLPActor(nn.Module):
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.relu(x)
         x = nn.Dense(self.action_dim, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
-        return x  
+        return x
 
 
 class DroQCritic(nn.Module):
@@ -133,7 +134,7 @@ class DroQCritic(nn.Module):
         x = nn.LayerNorm()(x)
         x = nn.relu(x)
         x = nn.Dense(self.action_dim)(x)
-        return x 
+        return x
 
 
 class MLPDroQCritic(nn.Module):
@@ -168,11 +169,14 @@ class TimeStep:
 
 def single_run(config: dict):
     config = {k.upper(): v for k, v in config.items() if k != "alg"}
+    pixel_based = config["PIXEL_BASED"]
+    env_id = config["ENV_ID"]
+    num_envs = config["NUM_ENVS"]
 
-    if config.get("PIXEL_BASED", True) and config.get("NUM_ENVS", 1) > 16:
+    if pixel_based and num_envs > 16:
         print("Warning: More than 16 environments may cause OOM on GPU when using pixel-based observations.")
 
-    run_name = f"{config['ENV_ID']}_{config['EXP_NAME']}_{'oc' if not config['PIXEL_BASED'] else 'pixel'}_{config['SEED']}"
+    run_name = f"{env_id}_{config['EXP_NAME']}_{'oc' if not pixel_based else 'pixel'}_{config['SEED']}"
 
     wandb.init(
         project=config.get("PROJECT", "jaxtari-blines"),
@@ -180,31 +184,29 @@ def single_run(config: dict):
         config=config,
         name=run_name,
         save_code=True,
+        mode=config.get("WANDB_MODE", "online"),
     )
     wandb.define_metric("*", step_metric="charts/global_step")
 
-    # do not modify the seeding
+    # same seeding order as dqn/pqn: python/numpy seeds, then key -> network keys -> env resets
     random.seed(config["SEED"])
     np.random.seed(config["SEED"])
     key = jax.random.PRNGKey(config["SEED"])
 
-    train_mods = list(config.get("TRAIN_MODS", []))
-    train_label = "default" if not train_mods else "_".join(str(m) for m in train_mods)
-
     env = make_env(
-        config.get("ENV_ID"),
-        train_mods,
-        config.get("PIXEL_BASED", True),
+        env_id,
+        list(config.get("TRAIN_MODS") or []),
+        pixel_based,
         config.get("NATIVE_DOWNSCALING", True),
         False,
     )()
 
     action_dim = env.action_space().n
     obs_shape = env.observation_space().shape
-    if config.get("PIXEL_BASED", True):
-        obs_shape = obs_shape[:-1]
+    if pixel_based:
+        obs_shape = obs_shape[:-1]  # drop the trailing grayscale channel
 
-    num_envs = config["NUM_ENVS"]
+    # if -1: we do as many gradient steps as collected samples (stable_baselines3 behavior)
     gradient_steps = num_envs * config.get("TRAIN_FREQUENCY", 4) if config.get("GRADIENT_STEPS", 1) == -1 else config.get("GRADIENT_STEPS", 1)
 
     @jax.jit
@@ -221,14 +223,19 @@ def single_run(config: dict):
     gamma = config.get("GAMMA", 0.99)
     tau = config.get("TAU", 0.005)
     batch_size = config.get("BATCH_SIZE", 256)
-    total_timesteps = config.get("TOTAL_TIMESTEPS", 10000000)
     M = config.get("NUM_CRITICS", 2)
     dropout_rate = config.get("DROPOUT_RATE", 0.01)
     target_entropy_scale = config.get("TARGET_ENTROPY_SCALE", 0.98)
     target_entropy = target_entropy_scale * jnp.log(action_dim)
     initial_log_alpha = jnp.array(np.log(config.get("INIT_ALPHA", 1.0)), dtype=jnp.float32)
 
-    pixel_based = config.get("PIXEL_BASED", True)
+    # one scan iteration advances every env by TRAIN_FREQUENCY steps
+    scan_steps, num_chunks, steps_per_chunk = plan_chunks(
+        config["TOTAL_TIMESTEPS"],
+        num_envs * config.get("TRAIN_FREQUENCY", 4),
+        config.get("SCAN_STEPS", 1000),
+    )
+
     actor_net = Actor(action_dim=action_dim) if pixel_based else MLPActor(action_dim=action_dim)
     critic_net = (
         DroQCritic(action_dim=action_dim, dropout_rate=dropout_rate)
@@ -237,9 +244,10 @@ def single_run(config: dict):
     )
 
     dummy_obs = jnp.zeros((1, *obs_shape))
-    key, actor_init_key, critic_init_key, alpha_init_key = jax.random.split(key, 4)
+    key, actor_init_key, critic_init_key = jax.random.split(key, 3)
     actor_params = actor_net.init(actor_init_key, dummy_obs)
 
+    # ensemble of M critics: vmap over the ensemble axis (not over seeds)
     critic_init_keys = jax.random.split(critic_init_key, M)
     critic_params_stacked = jax.vmap(
         lambda k: critic_net.init({"params": k, "dropout": k}, dummy_obs, training=False)
@@ -287,14 +295,14 @@ def single_run(config: dict):
         return jax.vmap(
             lambda p, k: critic_net.apply(p, obs, training=True, rngs={"dropout": k}),
             in_axes=(0, 0),
-        )(params_stacked, dropout_keys_stacked)  
+        )(params_stacked, dropout_keys_stacked)
 
     def full_droq_step(actor_state, critic_state, alpha_state, buffer_state, env_state, obs, rng, global_step):
         def take_action(carry, _):
             actor_state, critic_state, alpha_state, buffer_state, env_state, obs, global_step, rng = carry
             rng, act_key = jax.random.split(rng)
-            logits = actor_state.apply_fn(actor_state.params, obs)  
-            actions = jax.random.categorical(act_key, logits, axis=-1)  
+            logits = actor_state.apply_fn(actor_state.params, obs)
+            actions = jax.random.categorical(act_key, logits, axis=-1)
 
             next_obs, next_env_state, rewards, next_done, info = vmap_step(env_state, actions)
 
@@ -328,19 +336,19 @@ def single_run(config: dict):
             alpha_val = jnp.exp(alpha_state.params["log_alpha"])
 
             tgt_drop_keys = jax.random.split(tgt_drop_key, M)
-            target_q_all = critic_apply_all(critic_state.target_params, b_nobs, tgt_drop_keys)  
-            target_q_min = target_q_all.min(axis=0)  
+            target_q_all = critic_apply_all(critic_state.target_params, b_nobs, tgt_drop_keys)
+            target_q_min = target_q_all.min(axis=0)
 
             next_logits = actor_state.apply_fn(actor_state.params, b_nobs)
             next_log_probs = jax.nn.log_softmax(next_logits, axis=-1)
             next_probs = jnp.exp(next_log_probs)
-            V_next = (next_probs * (target_q_min - alpha_val * next_log_probs)).sum(axis=-1) 
+            V_next = (next_probs * (target_q_min - alpha_val * next_log_probs)).sum(axis=-1)
             y = jax.lax.stop_gradient(b_rew + gamma * (1.0 - b_don) * V_next)
 
             def critic_loss_fn(critic_params):
                 cri_drop_keys = jax.random.split(cri_drop_key, M)
-                q_all = critic_apply_all(critic_params, b_obs, cri_drop_keys)  
-                q_selected = q_all[:, jnp.arange(batch_size), b_act.reshape(-1)]  
+                q_all = critic_apply_all(critic_params, b_obs, cri_drop_keys)
+                q_selected = q_all[:, jnp.arange(batch_size), b_act.reshape(-1)]
                 loss = ((q_selected - y[None, :]) ** 2).mean()
                 return loss, q_selected.mean()
 
@@ -377,6 +385,7 @@ def single_run(config: dict):
             carry, (c_loss, a_loss, alpha_v, ent, q_m) = jax.lax.scan(do_update, carry, None, length=gradient_steps)
             return carry, (c_loss[-1], a_loss[-1], alpha_v[-1], ent[-1], q_m[-1])
 
+        # update only once the replay buffer holds LEARNING_STARTS samples
         (actor_state, critic_state, alpha_state, rng), (c_loss, a_loss, alpha_v, ent, q_m) = jax.lax.cond(
             replay_buffer.can_sample(buffer_state),
             lambda c: scanned_updates(c),
@@ -386,106 +395,93 @@ def single_run(config: dict):
 
         return (actor_state, critic_state, alpha_state, buffer_state, next_env_state, next_obs, rng, global_step), (infos, c_loss, a_loss, alpha_v, ent, q_m)
 
-    def save_and_eval(step_count):
-        if config.get("SAVE_PATH", "./models") is not None:
-            model_path = f'{config.get("SAVE_PATH", "./models")}/{run_name}/{config["EXP_NAME"]}_{step_count}_{int(time.time())}.cleanrl_model'
-            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    def save_and_eval(params, step_count):
+        if config.get("SAVE_PATH") is not None:
+            save_dir = os.path.join(config["SAVE_PATH"], run_name)
+            os.makedirs(save_dir, exist_ok=True)
+            model_path = os.path.join(save_dir, f'{config["EXP_NAME"]}_{step_count}_{int(time.time())}.cleanrl_model')
             with open(model_path, "wb") as f:
-                f.write(
-                    flax.serialization.to_bytes(
-                        [
-                            config,
-                            droq_carry[0].params, 
-                        ]
-                    )
-                )
+                f.write(flax.serialization.to_bytes([config, params]))
             print(f"model saved to {model_path}")
 
         print(f"running evaluation at step {step_count}...")
-
-        eval_mods = config["EVAL_MODS"] if len(config["EVAL_MODS"]) > 0 else config["TRAIN_MODS"]
-        eval_configs = [([], "default")]
-        if len(eval_mods) > 0:
-            mods_list = list(eval_mods)
-            for mod in mods_list:
-                mods_config = [mod] if not isinstance(mod, (list, tuple)) else list(mod)
-                mod_label = mod if isinstance(mod, str) else "_".join(str(m) for m in mods_config)
-                eval_configs.append((mods_config, mod_label))
-
         metrics = {}
-        for mods_cfg, mod_label in eval_configs:
+        for mods_cfg, mod_label in eval_mod_configs(config):
             episodic_returns, env_states = evaluate(
-                model_path,
+                params,
                 partial(
                     make_env,
                     mods=mods_cfg,
-                    pixel_based=config["PIXEL_BASED"],
-                    native_downscaling=config["NATIVE_DOWNSCALING"],
+                    pixel_based=pixel_based,
+                    native_downscaling=config.get("NATIVE_DOWNSCALING", True),
                     eval=True,
                 ),
-                config["ENV_ID"],
+                env_id,
                 eval_episodes=10,
-                Model=Actor if config["PIXEL_BASED"] else MLPActor,
-                seed=config["SEED"] + 42,
+                Model=Actor if pixel_based else MLPActor,
+                seed=config["SEED"] + 42,  # use a different seed for evaluation
             )
-            metrics[mod_label] = np.mean(jax.device_get(episodic_returns))
-            wandb.log({f"eval/episodic_return_{mod_label}": np.mean(jax.device_get(episodic_returns))}, step=step_count)
+            metrics[mod_label] = float(np.mean(jax.device_get(episodic_returns)))
+            wandb.log({f"eval/episodic_return_{mod_label}": metrics[mod_label]}, step=step_count)
 
-            if config["CAPTURE_VIDEO"]:
-                clean_renderer = jaxatari.make(config["ENV_ID"], mods=mods_cfg).renderer
-                frames = jax.vmap(clean_renderer.render)(env_states)
-                frames = jnp.transpose(frames, (0, 3, 1, 2))
+            if config.get("CAPTURE_VIDEO", False):
+                # Instantiate a clean renderer immune to the training env's downscaling
+                clean_renderer = jaxtari.make(env_id, mods=mods_cfg).renderer
+                frames = jnp.transpose(jax.vmap(clean_renderer.render)(env_states), (0, 3, 1, 2))
                 video = wandb.Video(np.array(frames), fps=30, format="mp4")
                 wandb.log({f"eval/video_{mod_label}": video}, step=step_count)
                 print(f"Video (eval) logged to wandb with {frames.shape[0]} frames ({mod_label}).")
         return metrics
 
-    # we step n_envs each iteration
-    print(f"[droq] start compile...")
-    start_compile = time.perf_counter()
     global_step = jnp.array(0, dtype=jnp.int32)
-    droq_carry = (actor_state, critic_state, alpha_state, buffer_state, _state, _obs, key, global_step)
+    carry = (actor_state, critic_state, alpha_state, buffer_state, _state, _obs, key, global_step)
 
-    @jax.jit
     def scanned_steps(carry):
         def step_fn(c, _):
             return full_droq_step(*c)
-        return jax.lax.scan(step_fn, carry, None, length=config.get("SCAN_STEPS", 1000))
+        return jax.lax.scan(step_fn, carry, None, length=scan_steps)
 
-    # warmup to trigger compilation
-    _ = jax.block_until_ready(scanned_steps(droq_carry))
-    end_compile = time.perf_counter()
-    print(f"[droq] compilation time: {end_compile - start_compile:.2f}s")
-    steps_per_iteration = config.get("NUM_ENVS") * config.get("TRAIN_FREQUENCY") * config.get("SCAN_STEPS")
-    rtpt = RTPT(name_initials=config["NAME_INITIALS"], experiment_name=run_name, max_iterations=total_timesteps // steps_per_iteration)
+    print("[droq] start compile...")
+    start_compile = time.perf_counter()
+    # donate the carry so XLA reuses the replay buffer's memory; lower/compile AOT so nothing is donated before the loop
+    compiled = jax.jit(scanned_steps, donate_argnums=(0,)).lower(carry).compile()
+    print(f"[droq] compilation time: {time.perf_counter() - start_compile:.2f}s")
+
+    rtpt = RTPT(name_initials=config["NAME_INITIALS"], experiment_name=run_name, max_iterations=num_chunks)
     rtpt.start()
     run_time = time.perf_counter()
-    print(f"[droq] starting training for {total_timesteps} steps...")
-    while global_step < total_timesteps:
+    print(f"[droq] starting training: {num_chunks} chunks x {steps_per_chunk} env steps")
+    for chunk in range(num_chunks):
         rtpt.step()
-        iteration = global_step // steps_per_iteration
-        if config["EVAL_DURING_TRAIN"] and iteration > 0 and iteration % config["EVAL_EVERY"] == 0:
-            save_and_eval(global_step)
-        iteration_time_start = time.perf_counter()
-        result = scanned_steps(droq_carry)
-        droq_carry, (infos, c_loss, a_loss, alpha_v, ent, q_m) = result
-        global_step = int(droq_carry[-1])
-        print(f"[droq] iteration {iteration} | global_step {global_step} | avg_return {infos['returned_episode_returns'][-1].mean():.2f} | avg_length {infos['returned_episode_lengths'][-1].mean():.2f} | c_loss {c_loss[-1]:.4f} | a_loss {a_loss[-1]:.4f} | alpha {alpha_v[-1]:.4f} | H {ent[-1]:.4f} | q {q_m[-1]:.4f} | SPS {int(global_step / (time.perf_counter() - run_time))} | SPS_update {int(steps_per_iteration / (time.perf_counter() - iteration_time_start))}")
+        if config["EVAL_DURING_TRAIN"] and chunk > 0 and chunk % config["EVAL_EVERY"] == 0:
+            save_and_eval(carry[0].params, int(carry[-1]))
+
+        chunk_start = time.perf_counter()
+        carry, (infos, c_loss, a_loss, alpha_v, ent, q_m) = compiled(carry)
+        global_step = int(carry[-1])
         metrics = {
-            "charts/avg_episodic_return": infos["returned_episode_returns"][-1].mean(),
-            "charts/avg_episodic_length": infos["returned_episode_lengths"][-1].mean(),
+            "charts/avg_episodic_return": float(infos["returned_episode_returns"][-1].mean()),
+            "charts/avg_episodic_length": float(infos["returned_episode_lengths"][-1].mean()),
             "losses/critic_loss": c_loss[-1].item(),
             "losses/actor_loss": a_loss[-1].item(),
             "losses/q_values": q_m[-1].item(),
             "losses/alpha": alpha_v[-1].item(),
             "losses/entropy": ent[-1].item(),
             "charts/SPS": int(global_step / (time.perf_counter() - run_time)),
-            "charts/SPS_update": int(steps_per_iteration / (time.perf_counter() - iteration_time_start)),
+            "charts/SPS_update": int(steps_per_chunk / (time.perf_counter() - chunk_start)),
             "charts/time": time.perf_counter() - run_time,
             "charts/global_step": global_step,
         }
         wandb.log(metrics, step=global_step)
+        print(
+            f"[droq] chunk {chunk + 1}/{num_chunks} | global_step {global_step} | "
+            f"avg_return {metrics['charts/avg_episodic_return']:.2f} | "
+            f"avg_length {metrics['charts/avg_episodic_length']:.2f} | "
+            f"c_loss {metrics['losses/critic_loss']:.4f} | a_loss {metrics['losses/actor_loss']:.4f} | "
+            f"alpha {metrics['losses/alpha']:.4f} | H {metrics['losses/entropy']:.4f} | "
+            f"q {metrics['losses/q_values']:.4f} | SPS {metrics['charts/SPS']}"
+        )
 
-    eval_metrics = save_and_eval(global_step + 1)
+    eval_metrics = save_and_eval(carry[0].params, global_step + 1)
     wandb.finish()
     return eval_metrics

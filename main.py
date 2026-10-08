@@ -24,6 +24,16 @@ def main(config):
             from agents.rainbow.rainbow import single_run
         elif alg == "C51":
             from agents.c51.c51 import single_run
+        elif alg == "APQN":
+            from agents.apqn.apqn import single_run
+        elif alg == "DROQ":
+            from agents.droq.droq import single_run
+        elif alg == "IQN":
+            from agents.iqn.iqn import single_run
+        elif alg == "SIMBA_PQN":
+            from agents.simba_pqn.simba_pqn import single_run
+        elif alg == "SIMBA_SAC":
+            from agents.simba_sac.simba_sac import single_run
         else:
             raise ValueError(f"Unknown ALG: {alg}")
 

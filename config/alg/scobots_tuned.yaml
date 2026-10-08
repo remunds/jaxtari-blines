@@ -1,0 +1,22 @@
+# SCoBots' hyperparameters, scaled out to many parallel JAXtari envs.
+ALG: SCOBOTS
+EXP_NAME: scobots_tuned
+
+REWARD_MODE: 0 # 0: env, 1: concept reward only ("human"), 2: both ("mixed")
+HIDDEN_DIMS: [64, 64]
+
+TOTAL_TIMESTEPS: 1e7
+LEARNING_RATE: 1e-3
+NUM_ENVS: 1024
+NUM_STEPS: 128
+ANNEAL_LR: True
+GAMMA: 0.99
+GAE_LAMBDA: 0.95
+NUM_MINIBATCHES: 512 # minibatches of 256, as in SCoBots
+UPDATE_EPOCHS: 3
+NORM_ADV: True
+CLIP_COEF: 0.1
+ANNEAL_CLIP: True
+ENT_COEF: 0.01
+VF_COEF: 2.0
+MAX_GRAD_NORM: 0.5

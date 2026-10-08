@@ -25,6 +25,7 @@ from jaxtari.wrappers import (
     FlattenObservationWrapper,
 )
 from agents.c51.c51_eval import evaluate
+from agents.run_utils import eval_mod_configs, plan_chunks
 from rtpt import RTPT
 
 
@@ -138,6 +139,7 @@ def single_run(config: dict):
         config=config,
         name=run_name,
         save_code=True,
+        mode=config.get("WANDB_MODE", "online"),
     )
     wandb.define_metric("*", step_metric="charts/global_step")
 
@@ -341,37 +343,20 @@ def single_run(config: dict):
 
         return (agent_state, buffer_state, next_env_state, next_obs, rng, global_step), (infos, loss, q_val)
 
-    def save_and_eval(step_count):
-        if config.get("SAVE_PATH", "./models") is not None:
-            model_path = f'{config.get("SAVE_PATH", "./models")}/{run_name}/{config["EXP_NAME"]}_{step_count}_{int(time.time())}.cleanrl_model'
-            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    def save_and_eval(q_params, step_count):
+        if config.get("SAVE_PATH") is not None:
+            save_dir = os.path.join(config["SAVE_PATH"], run_name)
+            os.makedirs(save_dir, exist_ok=True)
+            model_path = os.path.join(save_dir, f'{config["EXP_NAME"]}_{step_count}_{int(time.time())}.cleanrl_model')
             with open(model_path, "wb") as f:
-                f.write(
-                    flax.serialization.to_bytes(
-                        [
-                            config,
-                            c51_carry[0].params
-                         ]
-                    )
-                )
+                f.write(flax.serialization.to_bytes([config, q_params]))
             print(f"model saved to {model_path}")
 
         print(f"running evaluation at step {step_count}...")
-
-        # evaluate across all mods (and default train env)
-        eval_mods = config["EVAL_MODS"] if len(config["EVAL_MODS"]) > 0 else config["TRAIN_MODS"]
-        eval_configs = [([], "default")]
-        if len(eval_mods) > 0:
-            mods_list = list(eval_mods)
-            for mod in mods_list:
-                mods_config = [mod] if not isinstance(mod, (list, tuple)) else list(mod)
-                mod_label = mod if isinstance(mod, str) else "_".join(str(m) for m in mods_config)
-                eval_configs.append((mods_config, mod_label))
-
         metrics = {}
-        for mods_cfg, mod_label in eval_configs:
+        for mods_cfg, mod_label in eval_mod_configs(config):
             episodic_returns, env_states = evaluate(
-                model_path,
+                q_params,
                 partial(
                     make_env,
                     mods=mods_cfg,
@@ -383,72 +368,74 @@ def single_run(config: dict):
                 eval_episodes=10,
                 Model=C51CNNNetwork if config["PIXEL_BASED"] else C51MLPNetwork,
                 n_atoms=n_atoms,
-                v_min=v_min,
-                v_max=v_max,
+                v_min=config.get("V_MIN", -10.0),
+                v_max=config.get("V_MAX", 10.0),
                 seed=config["SEED"] + 42,  # use a different seed for evaluation
             )
-            metrics[mod_label] = np.mean(jax.device_get(episodic_returns))
-            wandb.log({f"eval/episodic_return_{mod_label}": np.mean(jax.device_get(episodic_returns))}, step=step_count)
+            metrics[mod_label] = float(np.mean(jax.device_get(episodic_returns)))
+            wandb.log({f"eval/episodic_return_{mod_label}": metrics[mod_label]}, step=step_count)
 
-            if config["CAPTURE_VIDEO"]:
+            if config.get("CAPTURE_VIDEO", False):
                 # Instantiate a clean renderer immune to the training env's downscaling
                 clean_renderer = jaxtari.make(config["ENV_ID"], mods=mods_cfg).renderer
-                frames = jax.vmap(clean_renderer.render)(env_states)
-                # shape: (N, H, W, C) -> (N, C, H, W)
-                frames = jnp.transpose(frames, (0, 3, 1, 2))
+                frames = jnp.transpose(jax.vmap(clean_renderer.render)(env_states), (0, 3, 1, 2))
                 video = wandb.Video(np.array(frames), fps=30, format="mp4")
-                wandb.log(
-                    {
-                        f"eval/video_{mod_label}": video,
-                    },
-                    step=step_count,
-                )
+                wandb.log({f"eval/video_{mod_label}": video}, step=step_count)
                 print(f"Video (eval) logged to wandb with {frames.shape[0]} frames ({mod_label}).")
         return metrics
 
-    # we step n_envs each iteration
+    # same budget rule for every agent: whole jitted chunks within TOTAL_TIMESTEPS
+    scan_steps, num_chunks, steps_per_chunk = plan_chunks(
+        config["TOTAL_TIMESTEPS"],
+        config["NUM_ENVS"] * config.get("TRAIN_FREQUENCY", 4),
+        config.get("SCAN_STEPS", 1000),
+    )
+
     print(f"[c51] start compile...")
     start_compile = time.perf_counter()
     global_step = jnp.array(0, dtype=jnp.int32)
-    c51_carry = (agent_state, buffer_state, _state, _obs, key, global_step)
+    carry = (agent_state, buffer_state, _state, _obs, key, global_step)
 
     def scanned_steps(carry):
         def step_fn(c, _):
             return full_c51_step(*c)
-        return jax.lax.scan(step_fn, carry, None, length=config.get("SCAN_STEPS", 1000))
+        return jax.lax.scan(step_fn, carry, None, length=scan_steps)
 
-    # donate the carry so XLA writes the new replay buffer over the old one instead of
-    # allocating a second copy; lower/compile AOT so nothing is donated before the loop
-    compiled = jax.jit(scanned_steps, donate_argnums=(0,)).lower(c51_carry).compile()
-    end_compile = time.perf_counter()
-    print(f"[c51] compilation time: {end_compile - start_compile:.2f}s")
-    steps_per_iteration = config.get("NUM_ENVS") * config.get("TRAIN_FREQUENCY") * config.get("SCAN_STEPS")
-    rtpt = RTPT(name_initials=config["NAME_INITIALS"], experiment_name=run_name, max_iterations=config.get("TOTAL_TIMESTEPS") // steps_per_iteration)
+    # donate the carry so XLA reuses the replay buffer's memory; lower/compile AOT so nothing is donated before the loop
+    compiled = jax.jit(scanned_steps, donate_argnums=(0,)).lower(carry).compile()
+    print(f"[c51] compilation time: {time.perf_counter() - start_compile:.2f}s")
+
+    rtpt = RTPT(name_initials=config["NAME_INITIALS"], experiment_name=run_name, max_iterations=num_chunks)
     rtpt.start()
     run_time = time.perf_counter()
-    print(f"[c51] starting training for {config.get('TOTAL_TIMESTEPS')} steps...")
-    while global_step < config.get("TOTAL_TIMESTEPS"):
+    print(f"[c51] starting training: {num_chunks} chunks x {steps_per_chunk} env steps")
+    for chunk in range(num_chunks):
         rtpt.step()
-        iteration = global_step // steps_per_iteration
-        if config["EVAL_DURING_TRAIN"] and iteration > 0 and iteration % config["EVAL_EVERY"] == 0:
-            save_and_eval(global_step)
-        iteration_time_start = time.perf_counter()
-        result = compiled(c51_carry)
-        c51_carry, (infos, loss, q_val) = result
-        global_step = int(c51_carry[-1])
-        print(f"[c51] iteration {iteration} | global_step {global_step} | avg_return {infos['returned_episode_returns'][-1].mean():.2f} | avg_length {infos['returned_episode_lengths'][-1].mean():.2f} | td_loss {loss[-1]:.4f} | q_val {q_val[-1]:.4f} | SPS {int(global_step / (time.perf_counter() - run_time))} | SPS_update {int(config['NUM_ENVS'] * config['TRAIN_FREQUENCY'] * config['SCAN_STEPS'] / (time.perf_counter() - iteration_time_start))}")
+        if config["EVAL_DURING_TRAIN"] and chunk > 0 and chunk % config["EVAL_EVERY"] == 0:
+            save_and_eval(carry[0].params, int(carry[-1]))
+
+        chunk_start = time.perf_counter()
+        carry, (infos, loss, q_val) = compiled(carry)
+        global_step = int(carry[-1])
         metrics = {
-            "charts/avg_episodic_return": infos["returned_episode_returns"][-1].mean(),
-            "charts/avg_episodic_length": infos["returned_episode_lengths"][-1].mean(),
+            "charts/avg_episodic_return": float(infos["returned_episode_returns"][-1].mean()),
+            "charts/avg_episodic_length": float(infos["returned_episode_lengths"][-1].mean()),
             "losses/td_loss": loss[-1].item(),
             "losses/q_values": q_val[-1].item(),
             "charts/SPS": int(global_step / (time.perf_counter() - run_time)),
-            "charts/SPS_update": int(config["NUM_ENVS"] * config["TRAIN_FREQUENCY"] * config["SCAN_STEPS"] / (time.perf_counter() - iteration_time_start)),
+            "charts/SPS_update": int(steps_per_chunk / (time.perf_counter() - chunk_start)),
             "charts/time": time.perf_counter() - run_time,
             "charts/global_step": global_step,
         }
         wandb.log(metrics, step=global_step)
+        print(
+            f"[c51] chunk {chunk + 1}/{num_chunks} | global_step {global_step} | "
+            f"avg_return {metrics['charts/avg_episodic_return']:.2f} | "
+            f"avg_length {metrics['charts/avg_episodic_length']:.2f} | "
+            f"td_loss {metrics['losses/td_loss']:.4f} | q_val {metrics['losses/q_values']:.4f} | "
+            f"SPS {metrics['charts/SPS']}"
+        )
 
-    eval_metrics = save_and_eval(global_step + 1)
+    eval_metrics = save_and_eval(carry[0].params, global_step + 1)
     wandb.finish()
     return eval_metrics

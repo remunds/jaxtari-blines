@@ -11,14 +11,9 @@ def main(config):
     starting_seed = merged_config.get("SEED", 0)
 
     alg = merged_config["ALG"]
-    if alg == "PQN":
-        # PQN vmaps its seeds inside a single compiled run, so it is launched once
-        seeds_to_run = [0]
-    else:
-        seeds_to_run = range(n_seeds)
 
     all_metrics = []
-    for seed in seeds_to_run:
+    for seed in range(n_seeds):
         if alg == "PPO":
             from agents.ppo.ppo import single_run
         elif alg == "DQN":

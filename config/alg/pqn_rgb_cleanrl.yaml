@@ -1,21 +1,23 @@
+# Pixel-based PQN, hyperparameters taken from scripts/benchmarks/config/alg/pqn_jaxtari_pixel.yaml (dev branch)
 ALG: PQN
 EXP_NAME: pqn
 
 PIXEL_BASED: True
 NATIVE_DOWNSCALING: True
 
-TOTAL_TIMESTEPS: 10000000
+TOTAL_TIMESTEPS: 100000000
+NUM_ENVS: 4096
 NUM_STEPS: 128
-SCAN_STEPS: 1000
+# updates per jitted chunk; must divide the number of updates for an exact budget (190 here)
+SCAN_STEPS: 10
 
-NUM_ENVS: 8
+NUM_MINIBATCHES: 2048 # batch_size 524288 / 2048 = 256 per minibatch
+UPDATE_EPOCHS: 1
 LEARNING_RATE: 2.5e-4
-NUM_MINIBATCHES: 4
-UPDATE_EPOCHS: 4
+ANNEAL_LR: False
+MAX_GRAD_NORM: 10.0
 GAMMA: 0.99
 Q_LAMBDA: 0.65
-MAX_GRAD_NORM: 10.0
-ANNEAL_LR: True
 START_E: 1.0
-END_E: 0.01
+END_E: 0.001
 EXPLORATION_FRACTION: 0.10

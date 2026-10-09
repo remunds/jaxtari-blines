@@ -1,6 +1,5 @@
 from typing import Callable
 
-import flax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -8,88 +7,84 @@ import jax.numpy as jnp
 from jaxtari.environment import JaxEnvironment
 from jaxtari.wrappers import JaxtariWrapper
 
+
 def evaluate(
-    model_path: str,
+    params,
     make_env: Callable,
     env_id: str,
     eval_episodes: int,
-    Model: nn.Module,
-    seed=1,
+    Model: tuple,
+    seed: int = 1,
 ):
+    """Run `eval_episodes` episodes in parallel with the greedy policy.
+
+    The greedy action is the argmax of the actor's logits. `params` are the PPO
+    AgentParams (network_params, actor_params, critic_params). Returns the per-episode returns and the env states of the first episode
+    up to its end (used for video logging).
+    """
     env: JaxEnvironment | JaxtariWrapper = make_env(env_id)()
-    _Network, _Actor, _Critic = Model
-    key = jax.random.key(seed)
+    Network, Actor = Model
+    network = Network()
+    actor = Actor(action_dim=env.action_space().n)
 
     @jax.jit
     def wrapped_reset(key):
-        """wrappes the reset function of the environment to correct the observation shape"""
-        next_obs, state = env.reset(key)
-        # NNs require shape (B, F, H, W), where B is the batch size and F is the frame stack size
-        return next_obs.squeeze()[None, ...], state
-
-    @jax.jit 
-    def wrapped_step(state, action):
-        """wrappes the step function of the environment to correct the observation shape"""
-        next_obs, next_state, reward, terminated, truncated, info =  env.step(state, action.squeeze())
-        done = jnp.logical_or(terminated, truncated)
-        # NNs require shape (B, F, H, W), where B is the batch size and F is the frame stack size
-        return next_obs.squeeze()[None, ...], next_state, reward, done, info
-
-    key, reset_key = jax.random.split(key)
-    network = _Network()
-    actor = _Actor(action_dim=env.action_space().n)
-    critic = _Critic()
-    key, network_key, actor_key, critic_key = jax.random.split(key, 4)
-    key, network_key_2, actor_key_2, critic_key_2 = jax.random.split(key, 4)
-    network_params = network.init(network_key, env.observation_space().sample(network_key_2).squeeze()[None, ...])
-    actor_params = actor.init(actor_key, network.apply(network_params, env.observation_space().sample(actor_key_2).squeeze()[None, ...]))
-    critic_params = critic.init(critic_key, network.apply(network_params, env.observation_space().sample(critic_key_2).squeeze()[None, ...]))
-    # note: critic_params is not used in this script
-    with open(model_path, "rb") as f:
-        (args, (network_params, actor_params, critic_params)) = flax.serialization.from_bytes(
-            (None, (network_params, actor_params, critic_params)), f.read()
-        )
+        """Reset the env and fix the observation shape to (1, *obs_shape)."""
+        obs, state = env.reset(key)
+        return obs.squeeze()[None, ...], state
 
     @jax.jit
-    def get_action_and_value(
-        network_params: flax.core.FrozenDict,
-        actor_params: flax.core.FrozenDict,
-        next_obs: jnp.ndarray,
-        key: jax.random.PRNGKey,
-    ):
-        hidden = network.apply(network_params, next_obs)
-        logits = actor.apply(actor_params, hidden)
-        # sample action: Gumbel-softmax trick
-        # see https://stats.stackexchange.com/questions/359442/sampling-from-a-categorical-distribution
-        key, subkey = jax.random.split(key)
-        u = jax.random.uniform(subkey, shape=logits.shape)
-        action = jnp.argmax(logits - jnp.log(-jnp.log(u)), axis=1)
-        return action, key
+    def wrapped_step(state, action):
+        """Step the env and fix the observation shape to (1, *obs_shape)."""
+        obs, state, reward, terminated, truncated, info = env.step(state, action.squeeze())
+        done = jnp.logical_or(terminated, truncated)
+        return obs.squeeze()[None, ...], state, reward, done, info
 
-    def step_fn(carry, input):
-        next_obs, env_state, keys = carry
-        actions, keys = jax.vmap(get_action_and_value, in_axes=(None, None, 0, 0))(network_params, actor_params, next_obs, keys)
-        next_obs, env_state, reward, done, infos = jax.vmap(wrapped_step)(env_state, jnp.array(actions))
-        first_states = jax.tree.map(lambda x: x[0], env_state)
-        # since the env is eval_env (without reward clipping and episodic life), we can just accumulate the rewards
-        return (next_obs, env_state, keys), (first_states, done, reward, actions) 
+    @jax.jit
+    def greedy_action(obs):
+        hidden = network.apply(params.network_params, obs)
+        return jnp.argmax(actor.apply(params.actor_params, hidden), axis=1)
 
-    # evaluate eval_episodes concurrently
-    reset_keys = jax.random.split(key, eval_episodes)
-    next_obs, env_states = jax.vmap(wrapped_reset)(reset_keys)
-    _, (first_states, dones, rewards, actions) = jax.lax.scan(step_fn, (next_obs, env_states, reset_keys), None, length=27_000) #27k * 4 (frame skip) = 108k frames, the max number typically used 
+    def step_fn(carry, _):
+        obs, env_state = carry
+        actions = jax.vmap(greedy_action)(obs)
+        obs, env_state, reward, done, _ = jax.vmap(wrapped_step)(env_state, actions)
+        first_state = jax.tree.map(lambda x: x[0], env_state)
+        return (obs, env_state), (first_state, done, reward)
 
+    @jax.jit
+    def scanned_step(carry):
+        return jax.lax.scan(step_fn, carry, None, length=1000)
 
-    # obs shape: (time, eval_episodes, 1, H, W)
-    first_done = jnp.argmax(dones, axis=0)  # shape: (eval_episodes,)
+    obs, env_states = jax.vmap(wrapped_reset)(jax.random.split(jax.random.PRNGKey(seed), eval_episodes))
+    carry = (obs, env_states)
+
+    first_states_chunks, done_chunks, reward_chunks = [], [], []
+    done_ever = jnp.zeros(eval_episodes, dtype=jnp.bool_)
+    while not jnp.all(done_ever):
+        carry, (first_states, dones, rewards) = scanned_step(carry)
+        first_states_chunks.append(first_states)
+        done_chunks.append(dones)
+        reward_chunks.append(rewards)
+        done_ever = done_ever | jnp.any(dones, axis=0)
+
+    first_states_history = jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *first_states_chunks)
+    dones = jnp.concatenate(done_chunks, axis=0)
+    rewards = jnp.concatenate(reward_chunks, axis=0)
+
+    # only count rewards up to and including each episode's first done
+    first_done = jnp.argmax(dones, axis=0)
     has_finished = jax.lax.cummax(dones.astype(jnp.int32), axis=0)
-    # shift right by one timestep
-    mask_after_first_done = jnp.pad(has_finished[:-1, :], ((1,0),(0,0)), constant_values=0)
-    # masked_rewards = rewards * (1 - mask_after_first_done)
-    rewards = rewards * (1 - mask_after_first_done)
-    episodic_returns = jnp.sum(rewards, axis=0)  # shape: (eval_episodes,)
+    mask_after_first_done = jnp.pad(has_finished[:-1, :], ((1, 0), (0, 0)), constant_values=0)
+    episodic_returns = jnp.sum(rewards * (1 - mask_after_first_done), axis=0)
+    print(
+        f"Evaluated {eval_episodes} episodes, mean return: {episodic_returns.mean():.2f}, "
+        f"std return: {episodic_returns.std():.2f}"
+    )
 
-    # first episode video capture
-    env_states_until_done = jax.tree.map(lambda x: x[:first_done[0] + 1], first_states.atari_state.atari_state.env_state)
-
+    # the state path depends on the wrapper stack (AtariWrapper -> PixelObsWrapper)
+    env_states_until_done = jax.tree.map(
+        lambda x: x[: int(first_done[0]) + 1],
+        first_states_history.atari_state.atari_state.env_state,
+    )
     return episodic_returns, env_states_until_done

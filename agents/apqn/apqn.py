@@ -178,9 +178,11 @@ def single_run(config: dict):
     # one chunk = scan_steps PQN updates. The rollout length L adapts only every adapt_freq updates,
     # so the scan length is rounded to a multiple of adapt_freq: adaptation happens exactly at chunk ends.
     scan_len = max(adapt_freq, (config.get("SCAN_STEPS", 1000) // adapt_freq) * adapt_freq)
+    # num_chunks is an upper bound (every chunk at L = NUM_STEPS_MIN); the loop below stops early once
+    # the next chunk at the current L would exceed TOTAL_TIMESTEPS, so the budget is never overshot
     scan_steps, num_chunks, steps_per_chunk = plan_chunks(
         total_timesteps,
-        num_envs * num_steps_min,  # smallest rollout; the planned budget assumes L = NUM_STEPS_MIN
+        num_envs * num_steps_min,
         scan_len,
     )
 
@@ -394,7 +396,11 @@ def single_run(config: dict):
     old_params = jax.tree_util.tree_map(lambda x: x.copy(), q_state.params)
     div_history = deque(maxlen=div_window)
 
+    global_step = 0
     for chunk in range(num_chunks):
+        if global_step + scan_steps * num_envs * num_steps > total_timesteps:
+            print(f"[apqn] stopping at global_step {global_step}: next chunk (L={num_steps}) would exceed TOTAL_TIMESTEPS")
+            break
         rtpt.step()
         if config["EVAL_DURING_TRAIN"] and chunk > 0 and chunk % config["EVAL_EVERY"] == 0:
             save_and_eval(carry[0].params, int(carry[5]))

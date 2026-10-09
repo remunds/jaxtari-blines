@@ -22,6 +22,7 @@ EXPLORATION_FRACTION: 0.10
 NUM_STEPS_MIN: 16
 NUM_STEPS_MAX: 64
 ADAPT_FREQ: 50           
+SCAN_STEPS: 50 # updates per jitted chunk; a multiple of ADAPT_FREQ, L adapts at chunk ends
 POLICY_CHANGE_LOW: 0.05  
 POLICY_CHANGE_HIGH: 0.95 
 EMA_BETA: 0.1            

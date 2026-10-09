@@ -244,7 +244,9 @@ def single_run(config: dict):
     )
 
     dummy_obs = jnp.zeros((1, *obs_shape))
-    key, actor_init_key, critic_init_key = jax.random.split(key, 3)
+    # same root split as dqn/c51/pqn, so env resets for a given seed match across agents
+    key, init_key = jax.random.split(key, 2)
+    actor_init_key, critic_init_key = jax.random.split(init_key)
     actor_params = actor_net.init(actor_init_key, dummy_obs)
 
     # ensemble of M critics: vmap over the ensemble axis (not over seeds)

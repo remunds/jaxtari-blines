@@ -250,7 +250,9 @@ def single_run(config: dict):
     )
 
 
-    key, actor_key, actor_key2, qf1_key, qf2_key = jax.random.split(key, 5)
+    # same root split as dqn/c51/pqn, so env resets for a given seed match across agents
+    key, init_key = jax.random.split(key, 2)
+    actor_key, actor_key2, qf1_key, qf2_key = jax.random.split(init_key, 4)
     
     expansion_factor = config.get("SIMBA_EXPANSION_FACTOR", 4)
     actor_kwargs = dict(

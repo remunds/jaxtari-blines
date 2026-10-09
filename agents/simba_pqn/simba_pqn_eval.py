@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxtari.environment import JaxEnvironment
-from jaxtari.wrappers import JaxatariWrapper
+from jaxtari.wrappers import JaxtariWrapper
 
 
 def evaluate(
@@ -20,7 +20,7 @@ def evaluate(
     Returns the per-episode returns and the env states of the first episode
     up to its end (used for video logging).
     """
-    env: JaxEnvironment | JaxatariWrapper = make_env(env_id)()
+    env: JaxEnvironment | JaxtariWrapper = make_env(env_id)()
     network = Model(action_dim=env.action_space().n)
 
     @jax.jit

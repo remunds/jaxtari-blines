@@ -1,0 +1,47 @@
+NAME_INITIALS: "MS"
+NUM_SEEDS: 1
+SEED: 0
+ALG: "PPO"
+EXP_NAME: "occam_binary"
+
+# ----- wandb -----
+ENTITY: ""
+PROJECT: "occam-jaxtari"
+
+# ----- saving -----
+SAVE_PATH: "./models"
+
+# ----- environment -----
+ENV_ID: pong                  
+TRAIN_MODS: []
+EVAL_MODS: []     
+EVAL_DURING_TRAIN: True
+EVAL_EVERY: 50
+VIDEO_EVERY: 1000
+CAPTURE_VIDEO: True
+
+# ----- OCCAM (object-centric masking) -----
+OCCAM: True
+MASK_MODE: "binary"
+OCCAM_FRAME_STACK: 4
+OCCAM_FRAME_SKIP: 4
+OCCAM_MAX_POOLING: True
+PIXEL_BASED: False
+NATIVE_DOWNSCALING: True
+
+# ----- PPO hyperparameters -----
+LEARNING_RATE: 2.5e-4
+NUM_ENVS: 32
+NUM_STEPS: 128
+TOTAL_TIMESTEPS: 1000000
+GAMMA: 0.99
+GAE_LAMBDA: 0.95
+NUM_MINIBATCHES: 4
+UPDATE_EPOCHS: 4
+CLIP_COEF: 0.1
+ENT_COEF: 0.01
+VF_COEF: 0.5
+MAX_GRAD_NORM: 0.5
+ANNEAL_LR: True
+NORM_ADV: True
+LABEL: ""

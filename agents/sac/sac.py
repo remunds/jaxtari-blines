@@ -49,7 +49,8 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
         )
         if pixel_based and occam_mask:
             # object masks instead of frames; same frame skip, pooling and stacking as PixelObsWrapper
-            env = OCCAMWrapper(env, mask_mode=occam_mask, clip_reward=not eval, game_name=env_id)
+            env = OCCAMWrapper(env, mask_mode=occam_mask, clip_reward=not eval, game_name=env_id,
+                               mods=mods, native_downscaling=native_downscaling)
         elif pixel_based:
             env = PixelObsWrapper(
                 env,

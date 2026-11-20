@@ -35,7 +35,7 @@ VIDEO_MAX_FRAMES: null
 CNN_TYPE: nature
 
 # OCCAM (Blüml et al., 2025) for pixel-based runs: object masks instead of frames.
-# null = plain frames, or one of binary | object | class | planes; ignored for OC
+# null = plain frames, or one of binary | object | class | planes | opc (planes + grayscale frame); ignored for OC
 OCCAM_MASK: null
 
 # reward machines (Toro Icarte et al., 2018) for object-centric runs: the game's RM

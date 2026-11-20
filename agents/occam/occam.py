@@ -14,6 +14,11 @@ Mask modes (F = frame stack, K = object groups)
     binary   255 inside any box                             (F, 84, 84, 1)
     class    one gray level per group                       (F, 84, 84, 1)
     planes   one binary plane per group                     (F * K, 84, 84, 1)
+    opc      planes plus the grayscale frame as last channel (F * (K + 1), 84, 84, 1)
+
+The grayscale channel of opc is the PixelObsWrapper frame: with native_downscaling (the
+agents pass NATIVE_DOWNSCALING, default True) it comes from the game's native 84x84 grayscale
+renderer, which needs `game_name` and `mods`; otherwise the frame is area-downscaled like the masks.
 
 Python
     OCCAMWrapper(AtariWrapper(jaxtari.make("pong")), mask_mode="class")
@@ -33,12 +38,19 @@ import jax
 import jax.numpy as jnp
 from flax import struct
 
-from jaxtari.wrappers import JaxtariWrapper, AtariWrapper
+from jaxtari.wrappers import (
+    AtariWrapper,
+    JaxtariWrapper,
+    _bcast_where,
+    _reset_with_active,
+    _unroll_frame_skip,
+    speculative_cond,
+)
 from jaxtari.environment import ObjectObservation
 from jaxtari import spaces
 
 
-MASK_MODES = ("object", "binary", "class", "planes")
+MASK_MODES = ("object", "binary", "class", "planes", "opc")
 
 _GRAY_W = jnp.array([0.2989, 0.5870, 0.1140], dtype=jnp.float32)
 
@@ -270,6 +282,8 @@ class OCCAMWrapper(JaxtariWrapper):
         clip_reward: bool = True,
         out_size: Tuple[int, int] = (84, 84),
         game_name: str = "unknown",
+        mods: List[str] | None = None,
+        native_downscaling: bool = False,
     ):
         super().__init__(env)
         assert isinstance(env, AtariWrapper), "OCCAMWrapper must be applied after AtariWrapper"
@@ -283,6 +297,8 @@ class OCCAMWrapper(JaxtariWrapper):
         self.out_h, self.out_w = int(out_size[0]), int(out_size[1])
 
         self.base_env = env._env
+        # auto-reset as ObjectCentricWrapper: only run the (no-op) reset when some env is done
+        self._speculative_autoreset = bool(env.noop_reset or env.first_fire)
         img_shape = self.base_env.image_space().shape
         self.img_h, self.img_w = int(img_shape[0]), int(img_shape[1])
 
@@ -299,7 +315,19 @@ class OCCAMWrapper(JaxtariWrapper):
         self._w_y = jnp.asarray(_area_weights(self.img_h, self.out_h), dtype=jnp.float32)
         self._w_x = jnp.asarray(_area_weights(self.img_w, self.out_w).T, dtype=jnp.float32)
 
-        self.per_frame_channels = self.num_classes if mask_mode == "planes" else 1
+        # opc: the gray channel from a separate copy of the game with JAXtari's native downscaled
+        # grayscale renderer (as PixelObsWrapper), so the training env's renderer stays untouched
+        self._gray_env = None
+        if mask_mode == "opc" and native_downscaling:
+            if game_name == "unknown":
+                raise ValueError("OCCAM opc with native_downscaling needs game_name (and the env's mods)")
+            import jaxtari
+            from jaxtari.modification import apply_native_downscaling
+
+            self._gray_env = jaxtari.make(game_name, mods=list(mods) if mods else None)
+            apply_native_downscaling(self._gray_env, (self.out_h, self.out_w), True)
+
+        self.per_frame_channels = {"planes": self.num_classes, "opc": self.num_classes + 1}.get(mask_mode, 1)
         total_channels = self.frame_stack_size * self.per_frame_channels
         self._observation_space = spaces.Box(
             low=0, high=255, shape=(total_channels, self.out_h, self.out_w, 1), dtype=jnp.uint8
@@ -308,8 +336,15 @@ class OCCAMWrapper(JaxtariWrapper):
     def observation_space(self) -> spaces.Box:
         return self._observation_space
 
-    def _mask_single(self, frame_rgb: jnp.ndarray, obs: Any) -> jnp.ndarray:
-        """(C, out_h, out_w) uint8 mask: drawn natively, area-downscaled, rounded like cv2."""
+    def _render_small_gray(self, env_state) -> jnp.ndarray:
+        """(1, out_h, out_w) uint8 frame of the native downscaled grayscale renderer (opc)."""
+        return self._gray_env.render(env_state)[..., 0][None].astype(jnp.uint8)
+
+    def _mask_single(self, frame_rgb: jnp.ndarray, obs: Any, small_gray: jnp.ndarray | None = None) -> jnp.ndarray:
+        """(C, out_h, out_w) uint8 mask: drawn natively, area-downscaled, rounded like cv2.
+
+        For opc with native downscaling, `small_gray` is the (1, out_h, out_w) gray channel.
+        """
         group_masks = _group_masks(obs, self.img_h, self.img_w)
 
         if self.mask_mode == "object":
@@ -319,22 +354,29 @@ class OCCAMWrapper(JaxtariWrapper):
             native = _union(group_masks).astype(jnp.float32)[None] * 255.0
         elif self.mask_mode == "class":
             native = self._gray_palette[_class_map(group_masks)].astype(jnp.float32)[None]
-        else:
+        else:  # planes, opc
             native = jnp.stack([gm.astype(jnp.float32) for gm in group_masks], axis=0) * 255.0
+            if self.mask_mode == "opc" and small_gray is None:
+                native = jnp.concatenate([native, jnp.round(_rgb_to_gray(frame_rgb))[None]], axis=0)
 
         out = _area_resize(native, self._w_y, self._w_x)
-        return jnp.clip(jnp.round(out), 0.0, 255.0).astype(jnp.uint8)
+        out = jnp.clip(jnp.round(out), 0.0, 255.0).astype(jnp.uint8)
+        if self.mask_mode == "opc" and small_gray is not None:
+            out = jnp.concatenate([out, small_gray], axis=0)
+        return out
 
     def _stack_to_obs(self, mask_stack: jnp.ndarray) -> jnp.ndarray:
         """(F, C, H, W) -> (F*C, H, W, 1) uint8."""
         f, c, h, w = mask_stack.shape
         return mask_stack.reshape(f * c, h, w)[..., None]
 
-    def _reset_internal(self, key):
+    def _reset_internal(self, key, active=True):
+        # `active` = False lanes of a batched auto-reset are discarded, so they skip the no-ops
         reset_key, _ = jax.random.split(key)
-        obs, atari_state = self._env.reset(reset_key)
+        obs, atari_state = _reset_with_active(self._env, reset_key, active)
         frame = self.base_env.render(atari_state.env_state)
-        m = self._mask_single(frame, obs)
+        small = self._render_small_gray(atari_state.env_state) if self._gray_env is not None else None
+        m = self._mask_single(frame, obs, small)
         mask_stack = jnp.stack([m] * self.frame_stack_size)
         return mask_stack, OCCAMState(atari_state, mask_stack)
 
@@ -345,31 +387,28 @@ class OCCAMWrapper(JaxtariWrapper):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def step(self, state: OCCAMState, action: int):
-        def body_fn(carry, _):
-            atari_state, action = carry
-            obs, new_atari_state, reward, terminated, truncated, info = self._env.step(
-                atari_state, action
-            )
-            return (new_atari_state, action), (
-                obs, new_atari_state.env_state, reward, terminated, truncated, info
-            )
-
-        (atari_state, _), (step_obs, env_states, rewards, terminations, truncations, infos) = jax.lax.scan(
-            body_fn, (state.atari_state, action), None, length=self.frame_skip
+        # unrolled frame skip (a nested lax.scan is several times slower on GPU)
+        atari_state, obs, env_states, rewards, terminations, truncations, info_dict = _unroll_frame_skip(
+            self._env, state.atari_state, action, self.frame_skip
         )
 
-        last_env_state = jax.tree.map(lambda z: z[-1], env_states)
+        last_env_state = env_states[-1]
 
+        # (renders a mode doesn't use are removed by XLA)
+        small = None
         if self.max_pooling and self.frame_skip > 1:
             img = self.base_env.render(last_env_state)
-            prev_env_state = jax.tree.map(lambda z: z[-2], env_states)
+            prev_env_state = env_states[-2]
             prev_img = self.base_env.render(prev_env_state)
             frame = jnp.maximum(img, prev_img)
+            if self._gray_env is not None:
+                small = jnp.maximum(self._render_small_gray(last_env_state), self._render_small_gray(prev_env_state))
         else:
             frame = self.base_env.render(last_env_state)
+            if self._gray_env is not None:
+                small = self._render_small_gray(last_env_state)
 
-        obs = jax.tree.map(lambda z: z[-1], step_obs)
-        new_mask = self._mask_single(frame, obs)
+        new_mask = self._mask_single(frame, obs, small)
         mask_stack = jnp.concatenate([state.mask_stack[1:], new_mask[None]], axis=0)
 
         reward = jnp.sum(rewards)
@@ -378,20 +417,21 @@ class OCCAMWrapper(JaxtariWrapper):
         terminated = terminations.any()
         truncated = truncations.any()
 
-        mask_stack, occ_state = jax.lax.cond(
-            jnp.logical_or(infos["env_done"].any(), truncated),
-            lambda: self._reset_internal(atari_state.key),
-            lambda: (mask_stack, OCCAMState(atari_state, mask_stack)),
-        )
+        # auto-reset on game over or truncation; under vmap a plain lax.cond would run the
+        # whole reset (no-ops, render, masks) for every env on every step
+        done = jnp.logical_or(info_dict["env_done"], truncated)
+        step_state = OCCAMState(atari_state, mask_stack)
+        if self._speculative_autoreset:
+            mask_stack, occ_state = speculative_cond(
+                lambda done, state: done,
+                lambda done, state: self._reset_internal(state.atari_state.key, done),
+                lambda done, state: (state.mask_stack, state),
+            )(done, step_state)
+        else:
+            mask_stack, occ_state = _bcast_where(
+                done, self._reset_internal(atari_state.key, done), (mask_stack, step_state)
+            )
 
-        def reduce_info(k, v):
-            if k in ["env_reward", "all_rewards"]:
-                return jnp.sum(v, axis=0)
-            if k == "env_done":
-                return jnp.any(v)
-            return v[-1]
-
-        info_dict = {k: reduce_info(k, v) for k, v in infos.items()}
         obs_out = self._stack_to_obs(mask_stack)
         return obs_out, occ_state, reward, terminated, truncated, info_dict
 
@@ -475,14 +515,20 @@ class _OCCAMViz:
         boxes = self._boxes_rgb(clean, obs)
         panel = self._to_obs_res(clean) if self.obs_res else clean
         boxes = self._to_obs_res(boxes) if self.obs_res else boxes
-        if self.mask_mode != "planes":
+        if self.mask_mode not in ("planes", "opc"):
             return jnp.concatenate([panel, boxes, mask_rgb], axis=1)
         h, w = panel.shape[0], panel.shape[1]
         sheets = _planes_isometric_rgb(
             self.planes_rgb(obs), self._color_palette,
             h, _sheets_width(w, self.num_classes), aspect=w / h,
         )
-        return jnp.concatenate([panel, boxes, mask_rgb, sheets], axis=1)
+        if self.mask_mode == "planes":
+            return jnp.concatenate([panel, boxes, mask_rgb, sheets], axis=1)
+        # opc: the grayscale pixel channel as a fifth panel
+        gray = jnp.round(_rgb_to_gray(clean)).astype(jnp.uint8)
+        gray = jnp.repeat(gray[..., None], 3, axis=-1)
+        gray = self._to_obs_res(gray) if self.obs_res else gray
+        return jnp.concatenate([panel, boxes, mask_rgb, sheets, gray], axis=1)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def _counts(self, env_state) -> jnp.ndarray:
@@ -501,12 +547,13 @@ class _OCCAMViz:
         """[(panel name, width)] in the order _frame concatenates them."""
         w = self.out_w if self.obs_res else self.img_w
         base = [("clean", w), ("obs boxes", w), (self.mask_mode, w)]
-        if self.mask_mode != "planes":
+        if self.mask_mode not in ("planes", "opc"):
             return base
-        return base + [("planes (sheets)", _sheets_width(w, self.num_classes))]
+        sheets = [("planes (sheets)", _sheets_width(w, self.num_classes))]
+        return base + sheets + ([("gray", w)] if self.mask_mode == "opc" else [])
 
     def frames(self, env_states) -> jnp.ndarray:
-        """(T, ...) base env states -> (T, H, W_row, 3) uint8; 4 panels in planes mode."""
+        """(T, ...) base env states -> (T, H, W_row, 3) uint8; 4 panels in planes mode, 5 in opc."""
         return jax.vmap(self._frame)(env_states)
 
 
